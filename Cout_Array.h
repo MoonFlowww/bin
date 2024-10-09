@@ -10,7 +10,7 @@
 
 namespace Array {
 
-// Fonction pour centrer une chaîne de caractères avec des marges
+
 inline std::string marge(const std::string& str, int totalWidth) {
     if (static_cast<int>(str.size()) >= totalWidth) {
         return str;
@@ -20,7 +20,6 @@ inline std::string marge(const std::string& str, int totalWidth) {
     return std::string(padding, ' ') + str + std::string(padding + extra, ' ');
 }
 
-// Fonction pour formater un tableau classique
 inline std::string ClassicArray(const std::vector<std::string>& s, bool title = false, bool color = false, bool addSpace = false) {
     std::ostringstream oss;
     std::vector<int> widths;
@@ -80,14 +79,12 @@ inline std::string DataArray(const std::vector<std::string>& data, const std::ve
     int max_cat_width = 0;
     int max_data_width = 0;
 
-    // Calcul de la largeur maximale des catégories
     for (const auto& category : cat) {
         if (static_cast<int>(category.size()) > max_cat_width) {
             max_cat_width = static_cast<int>(category.size());
         }
     }
 
-    // Calcul de la largeur maximale des données
     for (int i = title ? 1 : 0; i < heights; ++i) {
         int data_length = static_cast<int>(data[i].size());
         if (data_length > max_data_width) {
@@ -135,7 +132,7 @@ inline std::string DataArray(const std::vector<std::string>& data, const std::ve
             << "\033[1m\033[37m"
             << std::setw(max_data_width) << std::left << datum
             << "\033[0m"
-            << "  " << Vbar << "\n"; // Deux espaces avant Vbar
+            << "  " << Vbar << "\n"; // two spaces before the vertical bar
 
         if (i < heights - 1) {
             oss << InnerLine << "\n";
