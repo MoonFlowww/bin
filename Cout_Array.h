@@ -148,4 +148,4 @@ inline std::string DataArray(const std::vector<std::string>& data, const std::ve
 
 } // namespace Array
 
-#endif // ARRAYFORMATTER_H
+#endif // ARRAY_H
