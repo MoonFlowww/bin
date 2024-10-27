@@ -1,3 +1,4 @@
+// white board with formulas : https://www.tldraw.com/s/v2_c_HWbZwoIxgZLkzhmjECUAx?d=v243.-467.3623.1925.Owoa9ULqPO6J_H-hGiDK-
 #include <iostream>
 #include <random>
 #include <vector>
