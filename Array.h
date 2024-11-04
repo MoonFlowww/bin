@@ -147,6 +147,7 @@ namespace Array {
         std::ostringstream oss;
         int rows, cols;
 
+        //constexpr : 
         if constexpr (std::is_same<T, Eigen::MatrixXd>::value) {
             rows = matrix.rows();
             cols = matrix.cols();
