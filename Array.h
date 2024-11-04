@@ -142,54 +142,95 @@ namespace Array {
         return oss.str();
     }
 
-template <typename T> // in case std::vector<std::vector<..>> or Eigen::Matrix
-    std::string MatrixArray(const T& matrix, bool InnerGrid = false, bool color = false) {
+    template <typename T> // for Eigen::Matrix and std::vector<std::vector<..>>
+    inline std::string MatrixArray(const T& matrix, bool showGrid = false, bool showTitle = false, const std::string& title = "Matrix") {
         std::ostringstream oss;
         int rows, cols;
 
-        if constexpr (std::is_same<T, Eigen::MatrixXd>::value) { // constexpr : pre-compile
+        if constexpr (std::is_same<T, Eigen::MatrixXd>::value) {
             rows = matrix.rows();
             cols = matrix.cols();
-        } else if constexpr (std::is_same<T, std::vector<std::vector<double>>>::value) {
+        }
+        else if constexpr (std::is_same<T, std::vector<std::vector<double>>>::value) {
             rows = matrix.size();
             cols = rows > 0 ? matrix[0].size() : 0;
-        } else { return "Unsupported matrix type!"; }
-
-        int cellWidth = 10;
-        std::string Hbar = "+" + std::string(cols * cellWidth + cols - 1, '-') + "+";
-        std::string Vbar = "|";
-
-
-        if (color) {
-            Hbar.insert(0, "\033[1m\033[36m");
-            Hbar += "\033[0m";
-            Vbar.insert(0, "\033[1m\033[36m");
-            Vbar += "\033[0m";
+        }
+        else {
+            return "Unsupported Data type!\n Only Eigen::Matrix and std::vector<std::vector<..>> are valid!!";
         }
 
-        oss << Hbar << "\n";
+        int maxWidth = 0;
         for (int r = 0; r < rows; ++r) {
-            oss << Vbar;
             for (int c = 0; c < cols; ++c) {
-                double value;
+                std::ostringstream temp;
                 if constexpr (std::is_same<T, Eigen::MatrixXd>::value) {
-                    value = matrix(r, c);
-                } else {
-                    value = matrix[r][c];
+                    temp << matrix(r, c);
                 }
-                oss << " " << std::setw(cellWidth - 1) << std::left << value << Vbar;
+                else {
+                    temp << matrix[r][c];
+                }
+                maxWidth = std::max(maxWidth, static_cast<int>(temp.str().size()));
+            }
+        }
+        maxWidth += 2;
+
+        int totalWidth = cols * (maxWidth + 3) - 1;
+
+        std::string Hbar = "\033[34m+" + std::string(totalWidth, '-') + "+\033[0m";
+        std::string grayHbar = "\033[90m|" + std::string(totalWidth, '-') + "|\033[0m";
+        std::string grayVbar = "\033[90m|\033[0m";
+        std::string blueVbar = "\033[34m|\033[0m";
+
+        // Print the title if specified
+        if (showTitle) {
+            std::string displayTitle = title.empty() ? "Matrix" : title;
+            int padding = (totalWidth - displayTitle.size()) / 2;
+            int extra = (totalWidth - displayTitle.size()) % 2;
+            oss << Hbar << "\n";
+            oss << blueVbar << std::string(padding, ' ') << displayTitle << std::string(padding + extra, ' ') << blueVbar << "\n";
+        }
+
+        oss << Hbar << "\n"; // upper
+
+        for (int r = 0; r < rows; ++r) {
+            oss << blueVbar;
+            for (int c = 0; c < cols; ++c) {
+                std::ostringstream cell;
+                if constexpr (std::is_same<T, Eigen::MatrixXd>::value) {
+                    cell << matrix(r, c);
+                }
+                else {
+                    cell << matrix[r][c];
+                }
+                std::string cellStr = cell.str();
+                int padding = (maxWidth - cellStr.size()) / 2;
+                int extra = (maxWidth - cellStr.size()) % 2;
+
+                oss << " " << std::string(padding, ' ') << cellStr << std::string(padding + extra, ' ') << " ";
+
+                if (c < cols - 1) {
+                    oss << grayVbar;
+                }
+                else {
+                    oss << blueVbar;
+                }
             }
             oss << "\n";
-            if (InnerGrid && r < rows - 1) {
-                oss << "|" + std::string(cols * cellWidth + cols - 1, '-') + "|\n";
+
+
+            if (showGrid && r < rows - 1) {
+                oss << grayHbar << "\n";
             }
         }
-        oss << Hbar << "\n";
+
+        oss << Hbar << "\n"; // bottom
 
         return oss.str();
     }
 
 } // namespace Array
+
+#endif // ARRAY_H
 
 #endif // ARRAY_H
 
