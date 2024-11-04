@@ -180,8 +180,7 @@ namespace Array {
         std::string grayHbar = "\033[90m|" + std::string(totalWidth, '-') + "|\033[0m";
         std::string grayVbar = "\033[90m|\033[0m";
         std::string blueVbar = "\033[34m|\033[0m";
-
-        // Print the title if specified
+        
         if (showTitle) {
             std::string displayTitle = title.empty() ? "Matrix" : title;
             int padding = (totalWidth - displayTitle.size()) / 2;
@@ -229,8 +228,6 @@ namespace Array {
     }
 
 } // namespace Array
-
-#endif // ARRAY_H
 
 #endif // ARRAY_H
 
