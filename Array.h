@@ -142,6 +142,53 @@ namespace Array {
         return oss.str();
     }
 
+template <typename T> // in case std::vector<std::vector<..>> or Eigen::Matrix
+    std::string MatrixArray(const T& matrix, bool InnerGrid = false, bool color = false) {
+        std::ostringstream oss;
+        int rows, cols;
+
+        if constexpr (std::is_same<T, Eigen::MatrixXd>::value) { // constexpr : pre-compile
+            rows = matrix.rows();
+            cols = matrix.cols();
+        } else if constexpr (std::is_same<T, std::vector<std::vector<double>>>::value) {
+            rows = matrix.size();
+            cols = rows > 0 ? matrix[0].size() : 0;
+        } else { return "Unsupported matrix type!"; }
+
+        int cellWidth = 10;
+        std::string Hbar = "+" + std::string(cols * cellWidth + cols - 1, '-') + "+";
+        std::string Vbar = "|";
+
+
+        if (color) {
+            Hbar.insert(0, "\033[1m\033[36m");
+            Hbar += "\033[0m";
+            Vbar.insert(0, "\033[1m\033[36m");
+            Vbar += "\033[0m";
+        }
+
+        oss << Hbar << "\n";
+        for (int r = 0; r < rows; ++r) {
+            oss << Vbar;
+            for (int c = 0; c < cols; ++c) {
+                double value;
+                if constexpr (std::is_same<T, Eigen::MatrixXd>::value) {
+                    value = matrix(r, c);
+                } else {
+                    value = matrix[r][c];
+                }
+                oss << " " << std::setw(cellWidth - 1) << std::left << value << Vbar;
+            }
+            oss << "\n";
+            if (InnerGrid && r < rows - 1) {
+                oss << "|" + std::string(cols * cellWidth + cols - 1, '-') + "|\n";
+            }
+        }
+        oss << Hbar << "\n";
+
+        return oss.str();
+    }
+
 } // namespace Array
 
 #endif // ARRAY_H
