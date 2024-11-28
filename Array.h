@@ -143,30 +143,28 @@ namespace Array {
         return oss.str();
     }
 
-    template <typename T> // for Eigen::Matrix, std::vector<std::vector<..>>, and std::vector<std::pair<int, int>>
+    template <typename T>
     inline std::string MatrixArray(const T& matrix, bool showGrid = false, bool showTitle = false, const std::string& title = "Matrix") {
         std::ostringstream oss;
         int rows, cols;
 
-        // Determine the type and dimensions of the matrix
         if constexpr (std::is_same<T, Eigen::MatrixXd>::value) {
             rows = matrix.rows();
             cols = matrix.cols();
         }
         else if constexpr (std::is_same<T, std::vector<std::vector<double>>>::value) {
-            rows = matrix.size();
-            cols = rows > 0 ? matrix[0].size() : 0;
+            rows = static_cast<int>(matrix.size());
+            cols = rows > 0 ? static_cast<int>(matrix[0].size()) : 0;
         }
         else if constexpr (std::is_same<T, std::vector<std::pair<int, int>>>::value) {
-            rows = matrix.size();
-            cols = 2; // Each pair has two elements
+            rows = static_cast<int>(matrix.size());
+            cols = 2; 
         }
         else {
             return "Unsupported Data type!\n Only Eigen::Matrix, std::vector<std::vector<..>>, and std::vector<std::pair<int, int>> are valid!";
         }
 
         int maxWidth = 0;
-        // Calculate the maximum width needed for cell formatting
         for (int r = 0; r < rows; ++r) {
             for (int c = 0; c < cols; ++c) {
                 std::ostringstream temp;
@@ -193,11 +191,12 @@ namespace Array {
         std::string grayVbar = "\033[90m|\033[0m";
         std::string blueVbar = "\033[34m|\033[0m";
 
-        //title
+        // Title
         if (showTitle) {
             std::string displayTitle = title.empty() ? "Matrix" : title;
-            int padding = (totalWidth - displayTitle.size()) / 2;
-            int extra = (totalWidth - displayTitle.size()) % 2;
+            int paddingTotal = totalWidth > static_cast<int>(displayTitle.size()) ? totalWidth - static_cast<int>(displayTitle.size()) : 0;
+            int padding = paddingTotal / 2;
+            int extra = paddingTotal - padding * 2;
             oss << Hbar << "\n";
             oss << blueVbar << std::string(padding, ' ') << displayTitle << std::string(padding + extra, ' ') << blueVbar << "\n";
         }
@@ -222,8 +221,13 @@ namespace Array {
                 }
 
                 std::string cellStr = cell.str();
-                int padding = (maxWidth - cellStr.size()) / 2;
-                int extra = (maxWidth - cellStr.size()) % 2;
+                int paddingTotal = maxWidth > static_cast<int>(cellStr.size()) ? maxWidth - static_cast<int>(cellStr.size()) : 0;
+                int padding = paddingTotal / 2;
+                int extra = paddingTotal - padding * 2;
+
+                // Debugging output
+                // std::cout << "maxWidth: " << maxWidth << ", cellStr.size(): " << cellStr.size()
+                //           << ", padding: " << padding << ", extra: " << extra << '\n';
 
                 oss << " " << std::string(padding, ' ') << cellStr << std::string(padding + extra, ' ') << " ";
 
@@ -245,6 +249,7 @@ namespace Array {
 
         return oss.str();
     }
+
 
 
 } // namespace Array
