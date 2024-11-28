@@ -143,12 +143,12 @@ namespace Array {
         return oss.str();
     }
 
-    template <typename T> // for Eigen::Matrix and std::vector<std::vector<..>>
+    template <typename T> // for Eigen::Matrix, std::vector<std::vector<..>>, and std::vector<std::pair<int, int>>
     inline std::string MatrixArray(const T& matrix, bool showGrid = false, bool showTitle = false, const std::string& title = "Matrix") {
         std::ostringstream oss;
         int rows, cols;
 
-        //constexpr : 
+        // Determine the type and dimensions of the matrix
         if constexpr (std::is_same<T, Eigen::MatrixXd>::value) {
             rows = matrix.rows();
             cols = matrix.cols();
@@ -157,19 +157,30 @@ namespace Array {
             rows = matrix.size();
             cols = rows > 0 ? matrix[0].size() : 0;
         }
+        else if constexpr (std::is_same<T, std::vector<std::pair<int, int>>>::value) {
+            rows = matrix.size();
+            cols = 2; // Each pair has two elements
+        }
         else {
-            return "Unsupported Data type!\n Only Eigen::Matrix and std::vector<std::vector<..>> are valid!!";
+            return "Unsupported Data type!\n Only Eigen::Matrix, std::vector<std::vector<..>>, and std::vector<std::pair<int, int>> are valid!";
         }
 
         int maxWidth = 0;
+        // Calculate the maximum width needed for cell formatting
         for (int r = 0; r < rows; ++r) {
             for (int c = 0; c < cols; ++c) {
                 std::ostringstream temp;
                 if constexpr (std::is_same<T, Eigen::MatrixXd>::value) {
                     temp << matrix(r, c);
                 }
-                else {
+                else if constexpr (std::is_same<T, std::vector<std::vector<double>>>::value) {
                     temp << matrix[r][c];
+                }
+                else if constexpr (std::is_same<T, std::vector<std::pair<int, int>>>::value) {
+                    if (c == 0)
+                        temp << matrix[r].first;
+                    else
+                        temp << matrix[r].second;
                 }
                 maxWidth = std::max(maxWidth, static_cast<int>(temp.str().size()));
             }
@@ -177,14 +188,12 @@ namespace Array {
         maxWidth += 2;
 
         int totalWidth = cols * (maxWidth + 3) - 1;
-
-        //color fix for each part
         std::string Hbar = "\033[34m+" + std::string(totalWidth, '-') + "+\033[0m";
         std::string grayHline = "\033[90m" + std::string(totalWidth, '-') + "\033[0m";
         std::string grayVbar = "\033[90m|\033[0m";
-        std::string blueVbar = "\033[34m|\033[0m"; 
+        std::string blueVbar = "\033[34m|\033[0m";
 
-
+        //title
         if (showTitle) {
             std::string displayTitle = title.empty() ? "Matrix" : title;
             int padding = (totalWidth - displayTitle.size()) / 2;
@@ -193,8 +202,7 @@ namespace Array {
             oss << blueVbar << std::string(padding, ' ') << displayTitle << std::string(padding + extra, ' ') << blueVbar << "\n";
         }
 
-        oss << Hbar << "\n"; // upper
-
+        oss << Hbar << "\n"; // Upper bar
 
         for (int r = 0; r < rows; ++r) {
             oss << blueVbar;
@@ -203,15 +211,21 @@ namespace Array {
                 if constexpr (std::is_same<T, Eigen::MatrixXd>::value) {
                     cell << matrix(r, c);
                 }
-                else {
+                else if constexpr (std::is_same<T, std::vector<std::vector<double>>>::value) {
                     cell << matrix[r][c];
                 }
+                else if constexpr (std::is_same<T, std::vector<std::pair<int, int>>>::value) {
+                    if (c == 0)
+                        cell << matrix[r].first;
+                    else
+                        cell << matrix[r].second;
+                }
+
                 std::string cellStr = cell.str();
                 int padding = (maxWidth - cellStr.size()) / 2;
                 int extra = (maxWidth - cellStr.size()) % 2;
 
                 oss << " " << std::string(padding, ' ') << cellStr << std::string(padding + extra, ' ') << " ";
-
 
                 if (c < cols - 1) {
                     oss << grayVbar;
@@ -222,16 +236,16 @@ namespace Array {
             }
             oss << "\n";
 
-
             if (showGrid && r < rows - 1) {
                 oss << blueVbar << grayHline << blueVbar << "\n";
             }
         }
 
-        oss << Hbar << "\n"; // bottom
+        oss << Hbar << "\n"; // Lower bar
 
         return oss.str();
     }
+
 
 } // namespace Array
 
@@ -240,7 +254,7 @@ namespace Array {
 /* Exemple :
 int main() {
 
-    
+
     // 1 column
     std::vector<std::string> data1 = { "Ticket", "Pasta", "Lasagna", "Salade"};
     std::string array1 = Array::ClassicArray(data1, true, true, true); // ostringstream
