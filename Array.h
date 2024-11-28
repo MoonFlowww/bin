@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
+#include <Eigen/Dense>
 
 namespace Array {
 
