@@ -3,9 +3,26 @@ import pytz
 from dateutil.parser import parse
 import matplotlib.pyplot as plt
 
-data = pd.read_csv('EURUSD_Candlestick_5_M_ASK_01.01.2023-04.01.2025.csv')
-data['Gmt time'] = pd.to_datetime(data['Gmt time'], format='%d.%m.%Y %H:%M:%S.%f')
-data['Gmt time'] = data['Gmt time'].dt.tz_localize('GMT')
+
+candlestick_data = pd.read_csv('EURUSD_Candlestick_5_M_ASK_01.01.2023-04.01.2025.csv')
+candlestick_data['Gmt time'] = pd.to_datetime(candlestick_data['Gmt time'], format='%d.%m.%Y %H:%M:%S.%f')
+candlestick_data['Gmt time'] = candlestick_data['Gmt time'].dt.tz_localize('GMT')
+
+
+trades_data = pd.read_excel("C:\\Users\\PC\\Downloads\\trades_TimeApprox.xlsx")
+trades_data.columns = trades_data.columns.str.strip()
+
+trades_data['Date'] = pd.to_datetime(trades_data['Date'], format='%d/%m/%Y %H:%M:%S')
+trades_data['Entry'] = trades_data['Entry'].astype(str).str.replace(',', '.').astype(float)
+trades_data['TP'] = trades_data['TP'].astype(str).str.replace(',', '.').astype(float)
+trades_data['SL'] = trades_data['SL'].astype(str).str.replace(',', '.').astype(float)
+trades_data['BE'] = pd.to_numeric(trades_data['BE'].astype(str).str.replace(',', '.'), errors='coerce')
+trades_data['Management'] = pd.to_numeric(trades_data['Management'].astype(str).str.replace(',', '.'), errors='coerce')
+
+
+eurusd_trades = trades_data[trades_data['Asset'] == 'EURUSD']
+eurusd_trades = eurusd_trades[(eurusd_trades['Date'] >= '2023-01-01') & (eurusd_trades['Date'] <= '2025-01-04')]
+
 
 def paris_to_gmt(paris_time_str):
     paris_tz = pytz.timezone('Europe/Paris')
@@ -15,6 +32,7 @@ def paris_to_gmt(paris_time_str):
     gmt_time = paris_time.astimezone(pytz.timezone('GMT'))
     return gmt_time
 
+
 def gmt_to_paris(gmt_time):
     paris_tz = pytz.timezone('Europe/Paris')
     paris_time = gmt_time.astimezone(paris_tz)
@@ -23,12 +41,10 @@ def gmt_to_paris(gmt_time):
 def calculate_return_and_mdd(entry_time, entry_price, trade_type, exit_price, data):
     trade_data = data[data['Gmt time'] >= entry_time]
     if trade_data.empty:
-        print("No data found after the entry time.")
         return None, None, None
     
     exit_candle = trade_data[(trade_data['Low'] <= exit_price) & (trade_data['High'] >= exit_price)]
     if exit_candle.empty:
-        print("No exit price found after the entry time.")
         return None, None, None
     
     exit_time = exit_candle.iloc[0]['Gmt time']
@@ -47,71 +63,92 @@ def calculate_return_and_mdd(entry_time, entry_price, trade_type, exit_price, da
         mdd = drawup.min()
         return_pct = ((entry_price - exit_price_actual) / entry_price) * 100
     else:
-        print("Invalid trade type. Use 'long' or 'short'.")
         return None, None, None
     
     return return_pct, mdd * 100, exit_time
 
-def find_and_plot(trade_date_str, trade_type, entry_price, exit_price, risk, data):
-    gmt_entry_time = paris_to_gmt(trade_date_str)
+def process_trade(trade, candlestick_data):
+    trade_date_str = trade['Date'].strftime('%d/%m/%Y %H:%M:%S')
+    trade_type = trade['TradeType']
+    entry_price = trade['Entry']
+    tp = trade['TP']
+    sl = trade['SL']
+    state = trade['State']
+    be = trade['BE']
+    management = trade['Management']
     
+    if state.lower() == "lose":
+        if be == 1 and pd.isna(management):
+            exit_price = entry_price * 1.001
+        elif be == 1 and not pd.isna(management):
+            exit_price = management
+        else:
+            exit_price = sl
+    elif state.lower() == "win":
+        exit_price = tp
+    else:
+        return None, None
+    
+    gmt_entry_time = paris_to_gmt(trade_date_str)
     start_time = gmt_entry_time - pd.Timedelta(hours=12)
     end_time = gmt_entry_time + pd.Timedelta(hours=12)
-    filtered_data = data[(data['Gmt time'] >= start_time) & (data['Gmt time'] <= end_time)]
+    filtered_data = candlestick_data[(candlestick_data['Gmt time'] >= start_time) & (candlestick_data['Gmt time'] <= end_time)]
     
     if filtered_data.empty:
-        print("No data found within the ±12-hour window.")
-        return
+        return None, None
     
     match_found = False
     for index, row in filtered_data.iterrows():
         if row['Low'] <= entry_price <= row['High']:
             match_time = row['Gmt time']
             match_price = entry_price
-            print(f"Price within HL range found at: {gmt_to_paris(match_time)} (Paris time)")
             match_found = True
             break
     
     if not match_found:
-        closest_candle = filtered_data.iloc[(filtered_data['Gmt time'] - gmt_entry_time).abs().idxmin()]
+        if len(filtered_data) == 0:
+            return None, None
+        closest_index = (filtered_data['Gmt time'] - gmt_entry_time).abs().idxmin()
+        closest_candle = filtered_data.loc[closest_index]
+
         match_time = closest_candle['Gmt time']
         match_price = closest_candle[['Open', 'High', 'Low', 'Close']].mean()
-        percentage_diff = ((entry_price - match_price) / match_price) * 100
-        print(f"No match found within HL range. Closest candle time: {gmt_to_paris(match_time)} (Paris time), Price: {match_price:.5f}, Percentage difference: {percentage_diff:.2f}%")
     
-    return_pct, mdd, exit_time = calculate_return_and_mdd(match_time, match_price, trade_type, exit_price, data)
-    if return_pct is not None and mdd is not None:
-        print(f"Return: {return_pct:.2f}%")
-        print(f"Maximum Drawdown (MDD): {mdd:.2f}%")
-        print(f"Calmar: {return_pct/-mdd if mdd < 0 else return_pct/risk:.2f}")
-        print(f"Exit time: {gmt_to_paris(exit_time)} (Paris time)")
+    return_pct, mdd, exit_time = calculate_return_and_mdd(match_time, match_price, trade_type, exit_price, candlestick_data)
+    if return_pct is None or mdd is None:
+        return None, None
     
-    typo = "v"
-    if(trade_type.lower() == "short"):
-        typo = "^"
-    plt.figure(figsize=(20, 6))
-    plt.scatter(match_time, entry_price, color="Green", label ="True")
-    plt.scatter(gmt_entry_time, entry_price, marker='x', color="Orange", label ="Approx")
-    plt.axhline(exit_price, color="Orange", label ="Exit Price")
-
-    plt.plot(filtered_data['Gmt time'], filtered_data['High'], label='High Price', color='DarkGray')
-    plt.plot(filtered_data['Gmt time'], filtered_data['Low'], label='Low Price', color='DarkGray')
-    plt.plot(filtered_data['Gmt time'], filtered_data['Close'], label='Close Price', color='white')
-
+    risk = 0.01
+    calmar = return_pct / (-mdd if mdd < 0 else risk)
     
-    plt.title(f"Price Movement on {gmt_entry_time.date()} (±12 Hours)")
-    plt.xlabel('Time (GMT)')
-    plt.ylabel('Price')
-    plt.legend()
-    plt.grid(False)
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plt.show()
+    result = {
+        'Date': trade['Date'],
+        'Asset': trade['Asset'],
+        'TradeType': trade_type,
+        'Entry': entry_price,
+        'Exit': exit_price,
+        'Return (%)': return_pct,
+        'MDD (%)': mdd,
+        'Calmar': calmar,
+        'Exit Time': gmt_to_paris(exit_time)
+    }
+    
+    return result, None
 
-trade_date = "25/04/2024 14:30:00"
-trade_type = "short"
-entry_price = 1.07386
-exit_price = 1.07159
-risk = 0.01 # instead of return calmar=inf due to no MDD/MDU lets do return/risk (which will always lead to high ratio, perfectly since there is no DD)
+results = []
+no_results = []
 
-find_and_plot(trade_date, trade_type, entry_price, exit_price, risk, data)
+for index, trade in eurusd_trades.iterrows():
+    result, no_result = process_trade(trade, candlestick_data)
+    if result:
+        results.append(result)
+    else:
+        no_results.append(trade)
+
+results_df = pd.DataFrame(results)
+no_results_df = pd.DataFrame(no_results)
+
+results_df.to_csv('C:\\Users\\PC\\Downloads\\results.csv', index=False)
+no_results_df.to_csv('C:\\Users\\PC\\Downloads\\no_results.csv', index=False)
+
+print("Results saved to 'results.csv' and 'no_results.csv'.")
