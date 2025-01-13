@@ -52,7 +52,7 @@ def calculate_return_and_mdd(entry_time, entry_price, trade_type, exit_price, da
     
     return return_pct, mdd * 100, exit_time
 
-def find_and_plot(trade_date_str, trade_type, entry_price, exit_price, data):
+def find_and_plot(trade_date_str, trade_type, entry_price, exit_price, risk, data):
     gmt_entry_time = paris_to_gmt(trade_date_str)
     
     start_time = gmt_entry_time - pd.Timedelta(hours=12)
@@ -83,13 +83,21 @@ def find_and_plot(trade_date_str, trade_type, entry_price, exit_price, data):
     if return_pct is not None and mdd is not None:
         print(f"Return: {return_pct:.2f}%")
         print(f"Maximum Drawdown (MDD): {mdd:.2f}%")
-        print(f"Calmar: {return_pct/-mdd:.2f}")
+        print(f"Calmar: {return_pct/-mdd if mdd < 0 else return_pct/risk:.2f}")
         print(f"Exit time: {gmt_to_paris(exit_time)} (Paris time)")
     
-    plt.figure(figsize=(12, 6))
+    typo = "v"
+    if(trade_type.lower() == "short"):
+        typo = "^"
+    plt.figure(figsize=(20, 6))
     plt.scatter(match_time, entry_price, color="Green", label ="True")
-    plt.scatter(gmt_entry_time, entry_price, color="Orange", label ="Approx")
+    plt.scatter(gmt_entry_time, entry_price, marker='x', color="Orange", label ="Approx")
+    plt.axhline(exit_price, color="Orange", label ="Exit Price")
+
+    plt.plot(filtered_data['Gmt time'], filtered_data['High'], label='High Price', color='DarkGray')
+    plt.plot(filtered_data['Gmt time'], filtered_data['Low'], label='Low Price', color='DarkGray')
     plt.plot(filtered_data['Gmt time'], filtered_data['Close'], label='Close Price', color='white')
+
     
     plt.title(f"Price Movement on {gmt_entry_time.date()} (±12 Hours)")
     plt.xlabel('Time (GMT)')
@@ -100,9 +108,10 @@ def find_and_plot(trade_date_str, trade_type, entry_price, exit_price, data):
     plt.tight_layout()
     plt.show()
 
-trade_date = "18/04/2024 11:00:00"
+trade_date = "25/04/2024 14:30:00"
 trade_type = "short"
-entry_price = 1.06827
-exit_price = 1.06181
+entry_price = 1.07386
+exit_price = 1.07159
+risk = 0.01 # instead of return calmar=inf due to no MDD/MDU lets do return/risk (which will always lead to high ratio, perfectly since there is no DD)
 
-find_and_plot(trade_date, trade_type, entry_price, exit_price, data)
+find_and_plot(trade_date, trade_type, entry_price, exit_price, risk, data)
