@@ -1,21 +1,25 @@
 #ifndef DUKASLOADER_HPP
 #define DUKASLOADER_HPP
+#include <system_error>
+#define NOMINMAX // curl include <windows.h> which use macros named min and max ....
+#include <curl/curl.h>
+#include <libpq-fe.h>
+#include <stdexcept>
 
-#include <string>
-#include <vector>
-#include <chrono>
-#include <ctime>
+#include <algorithm>
+#include <iostream>
 #include <fstream>
 #include <sstream>
 #include <iomanip>
-#include <stdexcept>
-#include <curl/curl.h>
-#include <lzma.h>
-#include <iostream>
 #include <cstring>
-#include <system_error>
+#include <string>
+#include <vector>
+#include <limits>
+#include <chrono>
+#include <lzma.h>
+#include <ctime>
 #include <cmath>
-#include <algorithm>
+#include <regex>
 
 class DukascopyDownloader {
 public:
@@ -24,20 +28,34 @@ public:
         const std::string& start_date,
         const std::string& end_date,
         const std::string& download_dir,
+        const std::string& timeframe = "",
+        const std::string& pg_url = "",
         int verbose_level = 2
-    ) : asset(asset), download_dir(download_dir), verbose_level(verbose_level) {
+    ) : asset(asset), download_dir(download_dir), verbose_level(verbose_level), pg_url(pg_url) {
+        if (!timeframe.empty()) {
+            parse_timeframe(timeframe);
+            aggregation_enabled = true;
+        }
+        else {
+            aggregation_enabled = false;
+        }
         std::cout << "Asset: " << asset << " || Range: " << start_date << " -> " << end_date << std::endl;
-        std::cout << "Path: ";
-        std::cout << download_dir + "/" + asset + "_ticks.csv" << std::endl;
         init_curl();
         parse_dates(start_date, end_date);
+        if (!pg_url.empty()) {
+            connect_to_postgres();
+            create_table();
+        }
         prepare_csv();
-        
     }
 
     ~DukascopyDownloader() {
         if (csv_file.is_open())
             csv_file.close();
+        if (pg_conn) {
+            PQfinish(pg_conn);
+            pg_conn = nullptr;
+        }
         curl_global_cleanup();
     }
 
@@ -118,6 +136,10 @@ public:
             if (verbose_level == 1)
                 update_progress(current_index, total_hours, total_bytes_downloaded, overall_start);
         }
+        if (has_current_bar) {
+            write_aggregated_bar(current_bar);
+            has_current_bar = false;
+        }
         if (verbose_level == 1)
             std::cout << std::endl;
     }
@@ -125,10 +147,25 @@ public:
 private:
     struct Tick {
         std::string timestamp;
+        std::chrono::system_clock::time_point timepoint;
         double ask;
         double bid;
         double ask_volume;
         double bid_volume;
+    };
+
+    struct AggregatedBar {
+        std::chrono::system_clock::time_point interval_start;
+        double open_ask;
+        double open_bid;
+        double high_ask;
+        double low_ask;
+        double close_ask;
+        double close_bid;
+        double high_bid;
+        double low_bid;
+        double total_ask_volume;
+        double total_bid_volume;
     };
 
     std::string asset;
@@ -137,6 +174,134 @@ private:
     std::string download_dir;
     int verbose_level;
     std::ofstream csv_file;
+    std::chrono::seconds aggregation_interval;
+    bool aggregation_enabled = false;
+    std::string timeframe;
+    PGconn* pg_conn = nullptr;
+    std::string pg_url;
+    AggregatedBar current_bar;
+    bool has_current_bar = false;
+
+
+
+    void parse_timeframe(const std::string& tf) {
+        std::regex pattern(R"(^(\d+)([smhd])$)"); // Supports any integer value with s/m/h/d
+        std::smatch matches;
+
+        if (!std::regex_match(tf, matches, pattern)) {
+            throw std::invalid_argument("Invalid timeframe format. Use formats like '30s', '45m', '2h', '1d'");
+        }
+
+        int value = std::stoi(matches[1]); // Extract numeric value
+        char unit = matches[2].str()[0];   // Extract unit
+
+        switch (unit) {
+        case 's': aggregation_interval = std::chrono::seconds(value); break;
+        case 'm': aggregation_interval = std::chrono::minutes(value); break;
+        case 'h': aggregation_interval = std::chrono::hours(value); break;
+        case 'd': aggregation_interval = std::chrono::hours(value * 24); break;
+        default:
+            throw std::invalid_argument("Invalid timeframe unit. Use 's' (seconds), 'm' (minutes), 'h' (hours), or 'd' (days)");
+        }
+
+        timeframe = tf;  // Store the timeframe for reference
+    }
+
+
+
+    void connect_to_postgres() {
+        pg_conn = PQconnectdb(pg_url.c_str());
+        if (PQstatus(pg_conn) != CONNECTION_OK) {
+            throw std::runtime_error("PostgreSQL connection failed: " + std::string(PQerrorMessage(pg_conn)));
+        }
+    }
+
+    std::string sanitize_identifier(const std::string& identifier) {
+        std::string sanitized;
+        for (char c : identifier) {
+            if (isalnum(c) || c == '_') {
+                sanitized += c;
+            }
+            else {
+                sanitized += '_';
+            }
+        }
+        return sanitized;
+    }
+
+    void create_table() {
+        std::string table_name;
+        std::string sanitized_asset = sanitize_identifier(asset);
+        if (aggregation_enabled) {
+            table_name = sanitized_asset + "_" + sanitize_identifier(timeframe);
+        }
+        else {
+            table_name = sanitized_asset + "_tickdata";
+        }
+
+        std::string create_sql;
+        if (aggregation_enabled) {
+            create_sql = "CREATE TABLE IF NOT EXISTS \"" + table_name + "\" ("
+                "interval_start TIMESTAMP WITH TIME ZONE PRIMARY KEY,"
+                "open_ask DOUBLE PRECISION,"
+                "high_ask DOUBLE PRECISION,"
+                "low_ask DOUBLE PRECISION,"
+                "close_ask DOUBLE PRECISION,"
+                "open_bid DOUBLE PRECISION,"
+                "high_bid DOUBLE PRECISION,"
+                "low_bid DOUBLE PRECISION,"
+                "close_bid DOUBLE PRECISION,"
+                "total_ask_volume DOUBLE PRECISION,"
+                "total_bid_volume DOUBLE PRECISION);";
+        }
+        else {
+            create_sql = "CREATE TABLE IF NOT EXISTS \"" + table_name + "\" ("
+                "timestamp TIMESTAMP WITH TIME ZONE,"
+                "ask DOUBLE PRECISION,"
+                "bid DOUBLE PRECISION,"
+                "ask_volume DOUBLE PRECISION,"
+                "bid_volume DOUBLE PRECISION);";
+        }
+
+        PGresult* res = PQexec(pg_conn, create_sql.c_str());
+        if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+            PQclear(res);
+            throw std::runtime_error("Failed to create table: " + std::string(PQerrorMessage(pg_conn)));
+        }
+        PQclear(res);
+    }
+
+    void write_aggregated_bar(const AggregatedBar& bar) {
+        // Write to CSV
+        std::tm time;
+        if (csv_file.is_open()) {
+            std::time_t t = std::chrono::system_clock::to_time_t(bar.interval_start);
+
+            gmtime_s(&time, &t);
+            csv_file << std::put_time(&time, "%Y-%m-%d %H:%M:%S") << ","
+                << bar.open_ask << "," << bar.high_ask << "," << bar.low_ask << "," << bar.close_ask << ","
+                << bar.open_bid << "," << bar.high_bid << "," << bar.low_bid << "," << bar.close_bid << ","
+                << bar.total_ask_volume << "," << bar.total_bid_volume << "\n";
+        }
+
+        // Write to PostgreSQL
+        if (pg_conn) {
+            std::string table_name = sanitize_identifier(asset) + (aggregation_enabled ? "_" + sanitize_identifier(timeframe) : "_tickdata");
+            std::ostringstream oss;
+            oss << "INSERT INTO \"" << table_name << "\" VALUES ("
+                << "'" << std::put_time(&time, "%Y-%m-%d %H:%M:%S") << "',"
+                << bar.open_ask << "," << bar.high_ask << "," << bar.low_ask << "," << bar.close_ask << ","
+                << bar.open_bid << "," << bar.high_bid << "," << bar.low_bid << "," << bar.close_bid << ","
+                << bar.total_ask_volume << "," << bar.total_bid_volume << ");";
+
+            PGresult* res = PQexec(pg_conn, oss.str().c_str());
+            if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+                PQclear(res);
+                throw std::runtime_error("Failed to insert bar: " + std::string(PQerrorMessage(pg_conn)));
+            }
+            PQclear(res);
+        }
+    }
 
     static size_t write_callback(void* contents, size_t size, size_t nmemb, void* userp) {
         auto* buffer = static_cast<std::vector<uint8_t>*>(userp);
@@ -155,14 +320,6 @@ private:
         }
     }
 
-    void parse_dates(const std::string& start_str, const std::string& end_str) {
-        start_time = parse_date(start_str);
-        end_time = parse_date(end_str);
-        if (start_time > end_time)
-            throw std::invalid_argument("Start date must be before end date");
-        end_time += std::chrono::hours(23);
-    }
-
     std::chrono::system_clock::time_point parse_date(const std::string& date_str) {
         std::tm tm = {};
         std::istringstream ss(date_str);
@@ -174,6 +331,12 @@ private:
         if (t == -1)
             throw std::invalid_argument("Invalid date");
         return std::chrono::system_clock::from_time_t(t);
+    }
+
+
+    void parse_dates(const std::string& start_date, const std::string& end_date) {
+        start_time = parse_date(start_date);
+        end_time = parse_date(end_date);
     }
 
     int download_file(const std::string& url, std::vector<uint8_t>& buffer) {
@@ -282,7 +445,10 @@ private:
         double bid_volume = bid_vol_raw;
 
         std::string ts = format_tick_timestamp(base_tm, offset);
-        return { ts, ask, bid, ask_volume, bid_volume };
+        time_t base_seconds = _mkgmtime(const_cast<std::tm*>(&base_tm));
+        auto base_timepoint = std::chrono::system_clock::from_time_t(base_seconds);
+        auto timepoint = base_timepoint + std::chrono::milliseconds(offset);
+        return { ts, timepoint, ask, bid, ask_volume, bid_volume };
     }
 
     void process_ticks(std::vector<uint8_t> data, const std::tm& base_tm) {
@@ -320,6 +486,12 @@ private:
 
         size_t num_ticks = data.size() / 20;
         log("Processing " + std::to_string(num_ticks) + " ticks");
+
+        AggregatedBar current_bar;
+        bool has_current_bar = false;
+        constexpr auto aggregation_interval = std::chrono::seconds(60); // Example interval
+        bool aggregation_enabled = true; // Flag to enable aggregation
+
         for (size_t i = 0; i < num_ticks; ++i) {
             const uint8_t* p = data.data() + i * 20;
             uint32_t offset = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
@@ -327,11 +499,58 @@ private:
                 log("Skipping tick with invalid offset: " + std::to_string(offset));
                 continue;
             }
+
             Tick tick = parse_tick20(p, base_tm);
-            write_tick(tick);
+
+            if (aggregation_enabled) {
+                auto aggregation_duration = std::chrono::duration_cast<std::chrono::system_clock::duration>(aggregation_interval);
+                auto remainder = tick.timepoint.time_since_epoch() % aggregation_duration;
+                auto interval_start = tick.timepoint - remainder;
+
+                if (has_current_bar) {
+                    if (interval_start != current_bar.interval_start) {
+                        write_aggregated_bar(current_bar);
+                        has_current_bar = false;
+                    }
+                }
+
+                if (!has_current_bar) {
+                    current_bar.interval_start = interval_start;
+                    current_bar.open_ask = tick.ask;
+                    current_bar.open_bid = tick.bid;
+                    current_bar.high_ask = tick.ask;
+                    current_bar.low_ask = tick.ask;
+                    current_bar.close_ask = tick.ask;
+                    current_bar.high_bid = tick.bid;
+                    current_bar.low_bid = tick.bid;
+                    current_bar.close_bid = tick.bid;
+                    current_bar.total_ask_volume = tick.ask_volume;
+                    current_bar.total_bid_volume = tick.bid_volume;
+                    has_current_bar = true;
+                }
+                else {
+                    current_bar.high_ask = std::max(current_bar.high_ask, tick.ask);
+                    current_bar.low_ask = std::min(current_bar.low_ask, tick.ask);
+                    current_bar.close_ask = tick.ask;
+                    current_bar.high_bid = std::max(current_bar.high_bid, tick.bid);
+                    current_bar.low_bid = std::min(current_bar.low_bid, tick.bid);
+                    current_bar.close_bid = tick.bid;
+                    current_bar.total_ask_volume += tick.ask_volume;
+                    current_bar.total_bid_volume += tick.bid_volume;
+                }
+            }
+            else {
+                write_tick(tick);
+            }
         }
+
+        if (has_current_bar) {
+            write_aggregated_bar(current_bar);
+        }
+
         log("Completed processing ticks");
     }
+
 
     std::string format_date_hour(const std::tm& tm) {
         std::ostringstream oss;
@@ -340,8 +559,8 @@ private:
     }
 
     std::chrono::system_clock::time_point skip_day(const std::chrono::system_clock::time_point& current) {
-        std::tm tm = {};
-        time_t t = std::chrono::system_clock::to_time_t(current);
+        std::time_t t = std::chrono::system_clock::to_time_t(current_bar.interval_start);
+        std::tm tm;
         gmtime_s(&tm, &t);
         tm.tm_hour = 0;
         tm.tm_min = 0;
@@ -380,33 +599,39 @@ private:
         auto now = std::chrono::steady_clock::now();
         auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - overall_start).count();
         long estimated_total = (progress > 0) ? static_cast<long>(elapsed_ms / progress) : 0;
-        long remaining = (progress > 0) ? estimated_total - elapsed_ms : 0;
+        long remaining_ms = (progress > 0) ? estimated_total - elapsed_ms : 0;
+
+        std::string time_remaining;
+        if (remaining_ms < 1000) {
+            time_remaining = std::to_string(remaining_ms) + " ms";
+        }
+        else if (remaining_ms < 60000) {
+            double seconds = remaining_ms / 1000.0;
+            time_remaining = std::to_string(seconds) + " sec";
+        }
+        else {
+            long minutes = remaining_ms / 60000;
+            long seconds = (remaining_ms % 60000) / 1000;
+            time_remaining = std::to_string(minutes) + " min " + std::to_string(seconds) + " sec";
+        }
+
         std::cout << "\r[";
         for (int i = 0; i < bar_width; ++i)
             std::cout << (i < pos ? "#" : " ");
-        std::cout << "] " << int(progress * 100) << "%, Remaining: " << remaining << " ms, Total Downloaded: " << total_bytes << " bytes" << std::flush;
+        std::cout << "] " << int(progress * 100) << "%, Remaining: " << time_remaining
+            << ", Total Downloaded: " << total_bytes << " bytes" << std::flush;
     }
+
 };
 
 #endif // DUKASLOADER_HPP
 
 
-
-
-
-
-/* 
-- .bi5 are not saved on the disk
-- every things goes in a csvfile with UTC
-- Volume seem stuck v[n] == v[n-1] := when no volume but price mouvement
-- all data come in 1 tick AskP, BidP, AskV, BidV
-
-/!\ seem to not erase old files and stay stuck on the oldest
-
+/*
 #include "Dukasloader.hpp"
 
 int main() {
-    DukascopyDownloader downloader("EURUSD", "2023-01-01", "2023-01-10", "C:/Users/PC/Downloads/Assets_Data/Forex", 1);
+    DukascopyDownloader downloader("EURUSD", "2023-01-01", "2023-01-10", "PATH", "30s", "POSTGRE_URL", 1); // 1: Progress Bar, 2: Verbose
     downloader.download();
     return 0;
 }
