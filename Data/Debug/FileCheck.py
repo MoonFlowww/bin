@@ -1,9 +1,9 @@
 import csv
 import os
 
-def analyze_indicators(csv_path, root_dir):
+def Analyzer(csv_path, root_dir):
     """
-    1) Identifies missing indicators (present in CSV but not found).
+    1) Identifies missing file (present in CSV but not found).
     2) Identifies expected folders not found.
     3) Identifies files that exist but not present in the csv.
     4) Checks if a file in the wrong folder compared to what's listed in the CSV.
@@ -96,7 +96,7 @@ def analyze_indicators(csv_path, root_dir):
             print(f" - {found_folder}/{filename} (expected folder(s): {valid_list})")
 
     if all_ok:
-        print("All indicators are present. No missing files, extra files, or wrong folders!")
+        print("All files are present. No missing files, extra files, or wrong folders!")
 
 
 if __name__ == "__main__":
