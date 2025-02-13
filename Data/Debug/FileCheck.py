@@ -102,4 +102,4 @@ def Analyzer(csv_path, root_dir):
 if __name__ == "__main__":
     csv_path = "CSV_PATH"
     root_dir = "ROOT"
-    analyze_indicators(csv_path, root_dir)
+    Analyzer(csv_path, root_dir)
