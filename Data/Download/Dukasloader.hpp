@@ -1,11 +1,12 @@
 #ifndef DUKASLOADER_HPP
 #define DUKASLOADER_HPP
+
 #include <system_error>
-#define NOMINMAX // curl include <windows.h> which use macros named min and max ....
+#define NOMINMAX // curl include <windows.h> which use 
 #include <curl/curl.h>
+#include <filesystem>
 #include <libpq-fe.h>
 #include <stdexcept>
-
 #include <algorithm>
 #include <iostream>
 #include <fstream>
@@ -21,17 +22,19 @@
 #include <cmath>
 #include <regex>
 
+
 class DukascopyDownloader {
 public:
     DukascopyDownloader(
         const std::string& asset,
         const std::string& start_date,
         const std::string& end_date,
-        const std::string& download_dir,
+        const std::string& download_dir = "",
         const std::string& timeframe = "",
         const std::string& pg_url = "",
         int verbose_level = 2
-    ) : asset(asset), download_dir(download_dir), verbose_level(verbose_level), pg_url(pg_url) {
+    ) : asset(asset), download_dir(download_dir), verbose_level(verbose_level), pg_url(pg_url)
+    {
         if (!timeframe.empty()) {
             parse_timeframe(timeframe);
             aggregation_enabled = true;
@@ -42,13 +45,96 @@ public:
         std::cout << "Asset: " << asset << " || Range: " << start_date << " -> " << end_date << std::endl;
         init_curl();
         parse_dates(start_date, end_date);
+
+        // PostgreSQL handling
         if (!pg_url.empty()) {
             connect_to_postgres();
-            create_table();
+            std::string table_name = sanitize_identifier(asset) + (aggregation_enabled ? "_" + sanitize_identifier(timeframe) : "_tickdata");
+            // Check if table exists and contains data
+            std::string check_sql = "SELECT COUNT(*) FROM \"" + table_name + "\";";
+            PGresult* res = PQexec(pg_conn, check_sql.c_str());
+            bool table_exists = false;
+            if (PQresultStatus(res) == PGRES_TUPLES_OK) {
+                std::string count_str = PQgetvalue(res, 0, 0);
+                if (std::stoi(count_str) > 0)
+                    table_exists = true;
+            }
+            PQclear(res);
+            if (table_exists) {
+                std::cout << "Table \"" << table_name << "\" already exists with data. Update (u) or Restart (r)? ";
+                char response;
+                std::cin >> response;
+                if (response == 'u' || response == 'U') {
+                    std::string last_sql = aggregation_enabled ?
+                        "SELECT to_char(max(interval_start), 'YYYY-MM-DD HH24:MI:SS') FROM \"" + table_name + "\";" :
+                        "SELECT to_char(max(timestamp), 'YYYY-MM-DD HH24:MI:SS') FROM \"" + table_name + "\";";
+                    PGresult* res_last = PQexec(pg_conn, last_sql.c_str());
+                    if (PQresultStatus(res_last) == PGRES_TUPLES_OK) {
+                        char* last_ts = PQgetvalue(res_last, 0, 0);
+                        if (last_ts && std::string(last_ts).size() > 0) {
+                            std::tm tm = {};
+                            std::istringstream ss(last_ts);
+                            ss >> std::get_time(&tm, "%Y-%m-%d %H:%M:%S");
+                            if (!ss.fail()) {
+                                start_time = std::chrono::system_clock::from_time_t(_mkgmtime(&tm));
+                                if (verbose_level == 1)
+                                    std::cout << "Updated start date from table: " << last_ts << std::endl;
+                            }
+                        }
+                    }
+                    PQclear(res_last);
+                }
+                else {
+                    std::string drop_sql = "DROP TABLE IF EXISTS \"" + table_name + "\";";
+                    PGresult* res_drop = PQexec(pg_conn, drop_sql.c_str());
+                    PQclear(res_drop);
+                    create_table();
+                }
+            }
+            else {
+                create_table();
+            }
+            if (verbose_level == 1)
+                std::cout << "PostgreSQL connected and table ready: " << table_name << std::endl;
         }
-        prepare_csv();
-    }
 
+        // CSV handling
+        if (!download_dir.empty()) {
+            std::string csv_path = getOutputFilePath(download_dir, asset, aggregation_enabled);
+            if (std::filesystem::exists(csv_path)) {
+                std::cout << "CSV file " << csv_path << " already exists. Update (u) or Restart (r)? ";
+                char response;
+                std::cin >> response;
+                if (response == 'u' || response == 'U') {
+                    std::ifstream infile(csv_path);
+                    std::string line, last;
+                    while (std::getline(infile, line)) {
+                        if (!line.empty())
+                            last = line;
+                    }
+                    if (!last.empty()) {
+                        std::istringstream iss(last);
+                        std::string ts;
+                        if (std::getline(iss, ts, ',')) {
+                            std::tm tm = {};
+                            std::istringstream ss(ts);
+                            ss >> std::get_time(&tm, "%Y-%m-%d %H:%M:%S");
+                            if (!ss.fail()) {
+                                start_time = std::chrono::system_clock::from_time_t(_mkgmtime(&tm));
+                                if (verbose_level == 1)
+                                    std::cout << "Updated start date from CSV: " << ts << std::endl;
+                            }
+                        }
+                    }
+                }
+                else {
+                    std::error_code ec;
+                    std::filesystem::remove(csv_path, ec);
+                }
+            }
+            prepare_csv();
+        }
+    }
     ~DukascopyDownloader() {
         if (csv_file.is_open())
             csv_file.close();
@@ -59,6 +145,30 @@ public:
         curl_global_cleanup();
     }
 
+
+    std::string getOutputFilePath(const std::string& downloadDir, const std::string& asset, bool aggregationEnabled) {
+        return (std::filesystem::path(downloadDir) / (asset + (aggregationEnabled ? "_aggregated.csv" : "_ticks.csv"))).string();
+    }
+
+    bool handleExistingFile(const std::string& downloadDir, const std::string& asset, bool aggregationEnabled) {
+        std::string outputFile = getOutputFilePath(downloadDir, asset, aggregationEnabled);
+        if (std::filesystem::exists(outputFile)) {
+            std::cout << "File " << outputFile << " already exists. Remove it? (y/n): ";
+            char response;
+            std::cin >> response;
+            if (response == 'y' || response == 'Y') {
+                std::error_code ec;
+                if (std::filesystem::remove(outputFile, ec))
+                    return true;
+                else {
+                    std::cout << "Failed to remove file: " << ec.message() << std::endl;
+                    return false;
+                }
+            }
+            return false;
+        }
+        return true;
+    }
     void download() {
         auto current_time = start_time;
         int total_hours = std::chrono::duration_cast<std::chrono::hours>(end_time - start_time).count() + 1;
@@ -182,63 +292,48 @@ private:
     AggregatedBar current_bar;
     bool has_current_bar = false;
 
-
-
     void parse_timeframe(const std::string& tf) {
-        std::regex pattern(R"(^(\d+)([smhd])$)"); // Supports any integer value with s/m/h/d
+        std::regex pattern(R"(^(\d+)([smhd])$)");
         std::smatch matches;
-
-        if (!std::regex_match(tf, matches, pattern)) {
+        if (!std::regex_match(tf, matches, pattern))
             throw std::invalid_argument("Invalid timeframe format. Use formats like '30s', '45m', '2h', '1d'");
-        }
-
-        int value = std::stoi(matches[1]); // Extract numeric value
-        char unit = matches[2].str()[0];   // Extract unit
-
+        int value = std::stoi(matches[1]);
+        char unit = matches[2].str()[0];
         switch (unit) {
         case 's': aggregation_interval = std::chrono::seconds(value); break;
         case 'm': aggregation_interval = std::chrono::minutes(value); break;
         case 'h': aggregation_interval = std::chrono::hours(value); break;
         case 'd': aggregation_interval = std::chrono::hours(value * 24); break;
         default:
-            throw std::invalid_argument("Invalid timeframe unit. Use 's' (seconds), 'm' (minutes), 'h' (hours), or 'd' (days)");
+            throw std::invalid_argument("Invalid timeframe unit. Use 's', 'm', 'h', or 'd'");
         }
-
-        timeframe = tf;  // Store the timeframe for reference
+        timeframe = tf;
     }
 
 
 
     void connect_to_postgres() {
         pg_conn = PQconnectdb(pg_url.c_str());
-        if (PQstatus(pg_conn) != CONNECTION_OK) {
+        if (PQstatus(pg_conn) != CONNECTION_OK)
             throw std::runtime_error("PostgreSQL connection failed: " + std::string(PQerrorMessage(pg_conn)));
-        }
+        if (verbose_level == 1)
+            std::cout << "Connected to PostgreSQL at: " << pg_url << std::endl;
     }
 
     std::string sanitize_identifier(const std::string& identifier) {
         std::string sanitized;
-        for (char c : identifier) {
-            if (isalnum(c) || c == '_') {
-                sanitized += c;
-            }
-            else {
-                sanitized += '_';
-            }
-        }
+        for (char c : identifier)
+            sanitized += (isalnum(c) || c == '_') ? c : '_';
         return sanitized;
     }
 
     void create_table() {
         std::string table_name;
         std::string sanitized_asset = sanitize_identifier(asset);
-        if (aggregation_enabled) {
+        if (aggregation_enabled)
             table_name = sanitized_asset + "_" + sanitize_identifier(timeframe);
-        }
-        else {
+        else
             table_name = sanitized_asset + "_tickdata";
-        }
-
         std::string create_sql;
         if (aggregation_enabled) {
             create_sql = "CREATE TABLE IF NOT EXISTS \"" + table_name + "\" ("
@@ -262,38 +357,34 @@ private:
                 "ask_volume DOUBLE PRECISION,"
                 "bid_volume DOUBLE PRECISION);";
         }
-
         PGresult* res = PQexec(pg_conn, create_sql.c_str());
         if (PQresultStatus(res) != PGRES_COMMAND_OK) {
             PQclear(res);
             throw std::runtime_error("Failed to create table: " + std::string(PQerrorMessage(pg_conn)));
         }
         PQclear(res);
+        if (verbose_level == 1)
+            std::cout << "Table \"" << table_name << "\" is ready." << std::endl;
     }
 
     void write_aggregated_bar(const AggregatedBar& bar) {
-        // Write to CSV
-        std::tm time;
+        std::tm time_tm;
         if (csv_file.is_open()) {
             std::time_t t = std::chrono::system_clock::to_time_t(bar.interval_start);
-
-            gmtime_s(&time, &t);
-            csv_file << std::put_time(&time, "%Y-%m-%d %H:%M:%S") << ","
+            gmtime_s(&time_tm, &t);
+            csv_file << std::put_time(&time_tm, "%Y-%m-%d %H:%M:%S") << ","
                 << bar.open_ask << "," << bar.high_ask << "," << bar.low_ask << "," << bar.close_ask << ","
                 << bar.open_bid << "," << bar.high_bid << "," << bar.low_bid << "," << bar.close_bid << ","
                 << bar.total_ask_volume << "," << bar.total_bid_volume << "\n";
         }
-
-        // Write to PostgreSQL
         if (pg_conn) {
             std::string table_name = sanitize_identifier(asset) + (aggregation_enabled ? "_" + sanitize_identifier(timeframe) : "_tickdata");
             std::ostringstream oss;
             oss << "INSERT INTO \"" << table_name << "\" VALUES ("
-                << "'" << std::put_time(&time, "%Y-%m-%d %H:%M:%S") << "',"
+                << "'" << std::put_time(&time_tm, "%Y-%m-%d %H:%M:%S") << "',"
                 << bar.open_ask << "," << bar.high_ask << "," << bar.low_ask << "," << bar.close_ask << ","
                 << bar.open_bid << "," << bar.high_bid << "," << bar.low_bid << "," << bar.close_bid << ","
                 << bar.total_ask_volume << "," << bar.total_bid_volume << ");";
-
             PGresult* res = PQexec(pg_conn, oss.str().c_str());
             if (PQresultStatus(res) != PGRES_COMMAND_OK) {
                 PQclear(res);
@@ -320,6 +411,7 @@ private:
         }
     }
 
+
     std::chrono::system_clock::time_point parse_date(const std::string& date_str) {
         std::tm tm = {};
         std::istringstream ss(date_str);
@@ -333,7 +425,6 @@ private:
         return std::chrono::system_clock::from_time_t(t);
     }
 
-
     void parse_dates(const std::string& start_date, const std::string& end_date) {
         start_time = parse_date(start_date);
         end_time = parse_date(end_date);
@@ -343,7 +434,6 @@ private:
         CURL* curl = curl_easy_init();
         if (!curl)
             throw std::runtime_error("Failed to initialize cURL easy handle");
-
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
@@ -351,12 +441,10 @@ private:
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
         curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-
         CURLcode res = curl_easy_perform(curl);
         long http_code = 0;
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
         curl_easy_cleanup(curl);
-
         if (res != CURLE_OK)
             log("Download failed: " + url + " - " + curl_easy_strerror(res));
         if (http_code != 200)
@@ -419,14 +507,14 @@ private:
 
     std::string format_tick_timestamp(const std::tm& base_tm, uint32_t offset_ms) {
         time_t base_seconds = _mkgmtime(const_cast<std::tm*>(&base_tm));
-        time_t display_seconds = base_seconds + (offset_ms / 1000); // Removed +3600
+        time_t display_seconds = base_seconds + (offset_ms / 1000);
         unsigned ms = offset_ms % 1000;
         std::tm display_tm;
         gmtime_s(&display_tm, &display_seconds);
         std::ostringstream oss;
-        oss << std::put_time(&display_tm, "%d.%m.%Y %H:%M:%S")
+        oss << std::put_time(&display_tm, "%Y-%m-%d %H:%M:%S")
             << "." << std::setw(3) << std::setfill('0') << ms
-            << " GMT+0000"; // Keep it in UTC
+            << "+00";
         return oss.str();
     }
 
@@ -437,13 +525,11 @@ private:
         uint32_t bid_raw = (uint32_t(data[8]) << 24) | (uint32_t(data[9]) << 16) | (uint32_t(data[10]) << 8) | data[11];
         float ask_vol_raw = read_be_float(data + 12);
         float bid_vol_raw = read_be_float(data + 16);
-
         double point = (asset == "usdrub" || asset == "xagusd" || asset == "xauusd") ? 1e3 : 1e5;
         double ask = static_cast<double>(ask_raw) / point;
         double bid = static_cast<double>(bid_raw) / point;
         double ask_volume = ask_vol_raw;
         double bid_volume = bid_vol_raw;
-
         std::string ts = format_tick_timestamp(base_tm, offset);
         time_t base_seconds = _mkgmtime(const_cast<std::tm*>(&base_tm));
         auto base_timepoint = std::chrono::system_clock::from_time_t(base_seconds);
@@ -487,11 +573,6 @@ private:
         size_t num_ticks = data.size() / 20;
         log("Processing " + std::to_string(num_ticks) + " ticks");
 
-        AggregatedBar current_bar;
-        bool has_current_bar = false;
-        constexpr auto aggregation_interval = std::chrono::seconds(60); // Example interval
-        bool aggregation_enabled = true; // Flag to enable aggregation
-
         for (size_t i = 0; i < num_ticks; ++i) {
             const uint8_t* p = data.data() + i * 20;
             uint32_t offset = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
@@ -499,21 +580,17 @@ private:
                 log("Skipping tick with invalid offset: " + std::to_string(offset));
                 continue;
             }
-
             Tick tick = parse_tick20(p, base_tm);
-
             if (aggregation_enabled) {
-                auto aggregation_duration = std::chrono::duration_cast<std::chrono::system_clock::duration>(aggregation_interval);
+                auto aggregation_duration = aggregation_interval;
                 auto remainder = tick.timepoint.time_since_epoch() % aggregation_duration;
                 auto interval_start = tick.timepoint - remainder;
-
                 if (has_current_bar) {
                     if (interval_start != current_bar.interval_start) {
                         write_aggregated_bar(current_bar);
                         has_current_bar = false;
                     }
                 }
-
                 if (!has_current_bar) {
                     current_bar.interval_start = interval_start;
                     current_bar.open_ask = tick.ask;
@@ -543,14 +620,11 @@ private:
                 write_tick(tick);
             }
         }
-
         if (has_current_bar) {
             write_aggregated_bar(current_bar);
         }
-
         log("Completed processing ticks");
     }
-
 
     std::string format_date_hour(const std::tm& tm) {
         std::ostringstream oss;
@@ -559,19 +633,22 @@ private:
     }
 
     std::chrono::system_clock::time_point skip_day(const std::chrono::system_clock::time_point& current) {
-        std::time_t t = std::chrono::system_clock::to_time_t(current_bar.interval_start);
+        std::time_t t = std::chrono::system_clock::to_time_t(current);
         std::tm tm;
         gmtime_s(&tm, &t);
-        tm.tm_hour = 0;
-        tm.tm_min = 0;
-        tm.tm_sec = 0;
+        tm.tm_hour = tm.tm_min = tm.tm_sec = 0;
         tm.tm_mday += 1;
         time_t next_day = _mkgmtime(&tm);
         return std::chrono::system_clock::from_time_t(next_day);
     }
 
+
     void prepare_csv() {
-        std::string path = download_dir + "/" + asset + "_ticks.csv";
+        std::string folder_path = download_dir + "/" + asset;
+        std::error_code ec;
+        if (!std::filesystem::exists(folder_path, ec))
+            std::filesystem::create_directories(folder_path, ec);
+        std::string path = folder_path + "/" + asset + "_ticks.csv";
         csv_file.open(path, std::ios::app);
         if (!csv_file.is_open())
             throw std::runtime_error("Cannot open output file: " + path);
@@ -579,12 +656,42 @@ private:
             csv_file << "Timestamp,Ask,Bid,AskVolume,BidVolume\n";
     }
 
+    /*
+    void prepare_csv() {
+        std::string path = download_dir + "/" + asset + (aggregation_enabled ? "_aggregated.csv" : "_ticks.csv");
+        csv_file.open(path, std::ios::app);
+        if (!csv_file.is_open())
+            throw std::runtime_error("Cannot open output file: " + path);
+        if (csv_file.tellp() == 0) {
+            if (aggregation_enabled)
+                csv_file << "Timestamp,OpenAsk,HighAsk,LowAsk,CloseAsk,OpenBid,HighBid,LowBid,CloseBid,TotalAskVolume,TotalBidVolume\n";
+            else
+                csv_file << "Timestamp,Ask,Bid,AskVolume,BidVolume\n";
+        }
+    }
+    
+    */
+    
+
     void write_tick(const Tick& tick) {
-        csv_file << tick.timestamp << ","
-            << tick.ask << ","
-            << tick.bid << ","
-            << tick.ask_volume << ","
-            << tick.bid_volume << "\n";
+        csv_file << tick.timestamp << "," << tick.ask << "," << tick.bid << ","
+            << tick.ask_volume << "," << tick.bid_volume << "\n";
+        if (pg_conn) {
+            std::string table_name = sanitize_identifier(asset) + "_tickdata";
+            std::ostringstream oss;
+            oss << "INSERT INTO \"" << table_name << "\" VALUES ("
+                << "'" << tick.timestamp << "',"
+                << tick.ask << ","
+                << tick.bid << ","
+                << tick.ask_volume << ","
+                << tick.bid_volume << ");";
+            PGresult* res = PQexec(pg_conn, oss.str().c_str());
+            if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+                PQclear(res);
+                throw std::runtime_error("Failed to insert tick: " + std::string(PQerrorMessage(pg_conn)));
+            }
+            PQclear(res);
+        }
     }
 
     void log(const std::string& message) {
@@ -600,21 +707,16 @@ private:
         auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - overall_start).count();
         long estimated_total = (progress > 0) ? static_cast<long>(elapsed_ms / progress) : 0;
         long remaining_ms = (progress > 0) ? estimated_total - elapsed_ms : 0;
-
         std::string time_remaining;
-        if (remaining_ms < 1000) {
+        if (remaining_ms < 1000)
             time_remaining = std::to_string(remaining_ms) + " ms";
-        }
-        else if (remaining_ms < 60000) {
-            double seconds = remaining_ms / 1000.0;
-            time_remaining = std::to_string(seconds) + " sec";
-        }
+        else if (remaining_ms < 60000)
+            time_remaining = std::to_string(remaining_ms / 1000.0) + " sec";
         else {
             long minutes = remaining_ms / 60000;
             long seconds = (remaining_ms % 60000) / 1000;
             time_remaining = std::to_string(minutes) + " min " + std::to_string(seconds) + " sec";
         }
-
         std::cout << "\r[";
         for (int i = 0; i < bar_width; ++i)
             std::cout << (i < pos ? "#" : " ");
