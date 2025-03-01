@@ -171,7 +171,7 @@ public:
     }
     void download() {
         auto current_time = start_time;
-        int total_hours = std::chrono::duration_cast<std::chrono::hours>(end_time - start_time).count() + 1;
+        int total_hours = std::chrono::duration_cast<std::chrono::hours>(end_time - start_time).count();
         int current_index = 0;
         size_t total_bytes_downloaded = 0;
         auto overall_start = std::chrono::steady_clock::now();
@@ -185,11 +185,11 @@ public:
             int day = tm_base.tm_mday;
             int hour = tm_base.tm_hour;
             std::ostringstream oss_url;
-            oss_url << "https://datafeed.dukascopy.com/datafeed/" << asset
-                << "/" << year
-                << "/" << std::setw(2) << std::setfill('0') << month
-                << "/" << std::setw(2) << std::setfill('0') << day
-                << "/" << std::setw(2) << std::setfill('0') << hour << "h_ticks.bi5";
+            oss_url << "https://datafeed.dukascopy.com/datafeed/" << asset << "/"
+                << std::put_time(&tm_base, "%Y/")  // Year (4 digits)
+                << std::setw(2) << std::setfill('0') << tm_base.tm_mon << "/"  // Month[00;11] 00=January | 11=December
+                << std::put_time(&tm_base, "%d/")  // Day (01-31)
+                << std::put_time(&tm_base, "%H") << "h_ticks.bi5";  // Hour (00-23)
             std::string url = oss_url.str();
 
             if (verbose_level == 2)
@@ -415,6 +415,7 @@ private:
     std::chrono::system_clock::time_point parse_date(const std::string& date_str) {
         std::tm tm = {};
         std::istringstream ss(date_str);
+        ss.imbue(std::locale::classic()); //potential fix for the data shift
         ss >> std::get_time(&tm, "%Y-%m-%d");
         if (ss.fail())
             throw std::invalid_argument("Invalid date format, use YYYY-MM-DD");
@@ -644,7 +645,7 @@ private:
 
 
     void prepare_csv() {
-        std::string folder_path = download_dir + "/" + asset;
+        std::string folder_path = download_dir + "/" + asset + (aggregation_enabled ? "_aggregated.csv" : "_ticks.csv");
         std::error_code ec;
         if (!std::filesystem::exists(folder_path, ec))
             std::filesystem::create_directories(folder_path, ec);
@@ -652,8 +653,12 @@ private:
         csv_file.open(path, std::ios::app);
         if (!csv_file.is_open())
             throw std::runtime_error("Cannot open output file: " + path);
-        if (csv_file.tellp() == 0)
-            csv_file << "Timestamp,Ask,Bid,AskVolume,BidVolume\n";
+        if (csv_file.tellp() == 0) {
+            if (aggregation_enabled)
+                csv_file << "Timestamp,OpenAsk,HighAsk,LowAsk,CloseAsk,OpenBid,HighBid,LowBid,CloseBid,TotalAskVolume,TotalBidVolume\n";
+            else 
+                csv_file << "Timestamp,Ask,Bid,AskVolume,BidVolume\n";
+        }
     }
 
     /*
@@ -688,6 +693,7 @@ private:
             PGresult* res = PQexec(pg_conn, oss.str().c_str());
             if (PQresultStatus(res) != PGRES_COMMAND_OK) {
                 PQclear(res);
+
                 throw std::runtime_error("Failed to insert tick: " + std::string(PQerrorMessage(pg_conn)));
             }
             PQclear(res);
