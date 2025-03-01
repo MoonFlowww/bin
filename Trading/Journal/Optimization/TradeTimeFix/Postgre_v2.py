@@ -1,105 +1,203 @@
 import pandas as pd
-import pytz
-from dateutil.parser import parse
+import numpy as np
 import matplotlib.pyplot as plt
-from sqlalchemy import create_engine
 
+file_path = r"C:\Users\PC\Downloads\output\EURUSD_ticks.csv\EURUSD_ticks.csv"
+
+data = pd.read_csv(file_path)
+data['Local time'] = pd.to_datetime(data['Timestamp'], errors='coerce').dt.tz_localize(None)
+data['Ask'] = pd.to_numeric(data['Ask'], errors='coerce')
+data['Bid'] = pd.to_numeric(data['Bid'], errors='coerce')
+data['Mid'] = (data['Ask'] + data['Bid']) / 2
+
+
+"""
 # Connect to Postgres and fetch data.
 engine = create_engine('postgresql://postgres:Monarch@localhost:5432/PallasDB')
 query = 'SELECT timestamp, ask, bid, ask_volume, bid_volume FROM "EURUSD_tickdata"'
-data = pd.read_sql(query, engine, parse_dates=['timestamp'])
-data.rename(columns={'timestamp': 'Gmt time'}, inplace=True)
+data = pd.read_sql(query, engine, parse_dates=['Local time'])
+"""
 
-# DB timestamps are stored as "2023-01-01 01:00:12.304+01" (Paris time).
-# Convert them to GMT.
-data['Gmt time'] = data['Gmt time'].dt.tz_convert('GMT')
-# Create mid-price column.
-data['price'] = (data['ask'] + data['bid']) / 2
 
-# trade_date is provided in Paris time. Convert it to GMT.
-def paris_to_gmt(paris_time_str):
-    paris_tz = pytz.timezone('Europe/Paris')
-    paris_time = parse(paris_time_str)
-    return paris_tz.localize(paris_time, is_dst=None).astimezone(pytz.timezone('GMT'))
 
-def gmt_to_paris(gmt_time):
-    paris_tz = pytz.timezone('Europe/Paris')
-    return gmt_time.astimezone(paris_tz).strftime('%d/%m/%Y %H:%M:%S')
-
-def calculate_return_and_mdd(entry_time, entry_price, trade_type, exit_price, data):
-    trade_data = data[data['Gmt time'] >= entry_time]
-    if trade_data.empty:
+def calculate_return_and_mdd(entry_time, entry_price, trade_type, exit_price, exit_mode, data, risk, min_wait=pd.Timedelta(minutes=1)):
+    df = data[data['Local time'] >= entry_time].copy()
+    if df.empty:
         print("No data after entry.")
         return None, None, None
 
-    if trade_type.lower() == "long":
-        exit_tick = trade_data[trade_data['price'] >= exit_price]
-        if exit_tick.empty:
-            print("No exit tick for long.")
-            return None, None, None
-        exit_row = exit_tick.iloc[0]
-        exit_time = exit_row['Gmt time']
-        exit_price_actual = exit_row['price']
-        prices = trade_data['price']
-        mdd = ((prices - prices.cummax()) / prices.cummax()).min()
-        ret_pct = ((exit_price_actual - entry_price) / entry_price) * 100
-    elif trade_type.lower() == "short":
-        exit_tick = trade_data[trade_data['price'] <= exit_price]
-        if exit_tick.empty:
-            print("No exit tick for short.")
-            return None, None, None
-        exit_row = exit_tick.iloc[0]
-        exit_time = exit_row['Gmt time']
-        exit_price_actual = exit_row['price']
-        prices = trade_data['price']
-        mdd = ((prices.cummin() - prices) / prices.cummin()).min()
-        ret_pct = ((entry_price - exit_price_actual) / entry_price) * 100
+    # Standard TP/SL exit conditions.
+    if exit_mode.upper() in ["TP", "SL"]:
+        if trade_type.lower() == "long":
+            cond = df['Bid'] >= exit_price if exit_mode.upper() == "TP" else df['Bid'] <= exit_price
+            exit_rows = df[cond]
+            if exit_rows.empty:
+                print("No exit tick found for", exit_mode)
+                return None, None, None
+            exit_time = exit_rows.iloc[0]['Local time']
+            exit_price_actual = exit_rows.iloc[0]['Bid']
+            prices = df[df['Local time'] <= exit_time]['Bid']
+            mdd = ((prices - prices.cummax()) / prices.cummax()).min()
+            ret = ((exit_price_actual - entry_price) / (entry_price - sl)) * risk
+        elif trade_type.lower() == "short":
+            cond = df['Ask'] <= exit_price if exit_mode.upper() == "TP" else df['Ask'] >= exit_price
+            exit_rows = df[cond]
+            if exit_rows.empty:
+                print("No exit tick found for", exit_mode)
+                return None, None, None
+            exit_time = exit_rows.iloc[0]['Local time']
+            exit_price_actual = exit_rows.iloc[0]['Ask']
+            prices = df[df['Local time'] <= exit_time]['Ask']
+            mdd = ((prices.cummin() - prices) / prices.cummin()).min()
+            ret = ((entry_price - exit_price_actual) / (sl - entry_price)) * risk
+
+    # Partial exit uses SMA crossover and a dynamic waiting period.
+    elif exit_mode.upper() == "PARTIAL":
+        ma_window = 10 #sma window for reversal identification
+        if trade_type.lower() == "long":
+            df['SMA'] = df['Bid'].rolling(window=ma_window, min_periods=1).mean()
+            cond_T1 = (df['SMA'].shift(1) > exit_price) & (df['SMA'] <= exit_price)
+            candidates = df[cond_T1]
+            if candidates.empty:
+                print("No reversal found for partial exit (long).")
+                return None, None, None
+            T1 = candidates.iloc[0]['Local time']
+            tp_rows = df[df['Bid'] >= exit_price]
+            if tp_rows.empty:
+                print("No TP candidate found for partial exit (long).")
+                return None, None, None
+            T_tp = tp_rows.iloc[0]['Local time']
+            waiting_period = pd.Timedelta(seconds=(T_tp - entry_time).total_seconds() * 0.2)
+            if waiting_period < min_wait:
+                waiting_period = min_wait
+            threshold_time = T1 + waiting_period
+            print(f"(Long) Reversal condition: T1 = {T1}, T_tp = {T_tp}, entry = {entry_time}, waiting_period = {waiting_period}, threshold_time = {threshold_time}")
+            later_df = df[df['Local time'] >= threshold_time]
+            if later_df.empty:
+                exit_row = candidates.iloc[0]
+            else:
+                idx = (later_df['Bid'] - exit_price).abs().idxmin()
+                exit_row = later_df.loc[idx]
+            exit_time = exit_row['Local time']
+            exit_price_actual = exit_row['Bid']
+            prices = df[df['Local time'] <= exit_time]['Bid']
+            mdd = ((prices - prices.cummax()) / prices.cummax()).min()
+            ret = ((exit_price_actual - entry_price) / (entry_price - sl)) * risk
+
+        elif trade_type.lower() == "short":
+            df['SMA'] = df['Ask'].rolling(window=ma_window, min_periods=1).mean()
+            cond_T1 = (df['SMA'].shift(1) < exit_price) & (df['SMA'] >= exit_price)
+            candidates = df[cond_T1]
+            if candidates.empty:
+                print("No reversal found for partial exit (short).")
+                return None, None, None
+            T1 = candidates.iloc[0]['Local time']
+            tp_rows = df[df['Ask'] <= exit_price]
+            if tp_rows.empty:
+                print("No TP candidate found for partial exit (short).")
+                return None, None, None
+            T_tp = tp_rows.iloc[0]['Local time']
+            waiting_period = pd.Timedelta(seconds=(T_tp - entry_time).total_seconds() * 0.2)
+            if waiting_period < min_wait:
+                waiting_period = min_wait
+            threshold_time = T1 + waiting_period
+            print(f"(Short) Reversal condition: T1 = {T1}, T_tp = {T_tp}, entry = {entry_time}, waiting_period = {waiting_period}, threshold_time = {threshold_time}")
+            later_df = df[df['Local time'] >= threshold_time]
+            if later_df.empty:
+                exit_row = candidates.iloc[0]
+            else:
+                idx = (later_df['Ask'] - exit_price).abs().idxmin()
+                exit_row = later_df.loc[idx]
+            exit_time = exit_row['Local time']
+            exit_price_actual = exit_row['Ask']
+            prices = df[df['Local time'] <= exit_time]['Ask']
+            mdd = ((prices.cummin() - prices) / prices.cummin()).min()
+            ret = ((entry_price - exit_price_actual) / (sl - entry_price)) * risk
     else:
-        print("Invalid trade type.")
+        print("Invalid exit mode.")
         return None, None, None
 
-    return ret_pct, mdd * 100, exit_time
+    return ret, mdd * 100, exit_time
 
-def find_and_plot(trade_date_str, trade_type, entry_price, exit_price, risk, data):
-    # Convert trade_date from Paris time to GMT.
-    gmt_entry_time = paris_to_gmt(trade_date_str)
-    window = data[(data['Gmt time'] >= gmt_entry_time - pd.Timedelta(hours=12)) &
-                  (data['Gmt time'] <= gmt_entry_time + pd.Timedelta(hours=12))]
-    if window.empty:
-        print("No data in ±12h window.")
+def find_and_plot(trade_date_str, trade_type, entry_price, exit_price, sl, risk, exit_mode, data):
+    entry_time = pd.to_datetime(trade_date_str, errors='coerce')
+    initial_window = data[(data['Local time'] >= entry_time - pd.Timedelta(hours=12)) &
+                          (data['Local time'] <= entry_time + pd.Timedelta(hours=12))]
+    if initial_window.empty:
+        print("No data in initial ±12h window.")
         return
 
-    window['diff'] = (window['price'] - entry_price).abs()
-    closest = window.loc[window['diff'].idxmin()]
-    match_time, match_price = closest['Gmt time'], closest['price']
-    diff_pct = ((entry_price - match_price) / match_price) * 100
-    print(f"Closest tick: {gmt_to_paris(match_time)}; Price: {match_price:.5f}; Diff: {diff_pct:.2f}%")
+    price_col = 'Ask' if trade_type.lower() == 'long' else 'Bid'
+    closest_idx = (initial_window[price_col] - entry_price).abs().idxmin()
+    closest = initial_window.loc[closest_idx]
+    tol = 0.0001
+    if abs(closest[price_col] - entry_price) < tol:
+        match_time, match_price = closest['Local time'], entry_price
+        print(f"Exact tick at: {match_time}")
+    else:
+        match_time, match_price = closest['Local time'], closest[price_col]
+        diff = ((entry_price - match_price) / match_price) * 100
+        print(f"No exact match. Closest tick at {match_time}, price {match_price:.5f}, diff {diff:.2f}%")
 
-    ret_pct, mdd, exit_time = calculate_return_and_mdd(match_time, match_price, trade_type, exit_price, data)
-    if ret_pct is not None:
-        calmar = ret_pct / (-mdd if mdd < 0 else risk)
-        print(f"Return: {ret_pct:.2f}% | MDD: {mdd:.2f}% | Calmar: {calmar:.2f}")
-        print(f"Exit time: {gmt_to_paris(exit_time)}")
+    ret, mdd, exit_time = calculate_return_and_mdd(match_time, match_price, trade_type, exit_price, exit_mode, data, risk)
+    if ret is not None:
+        # Ulcer Index calculation.
+        trade_df = data[(data['Local time'] >= match_time) & (data['Local time'] <= exit_time)]
+        if trade_df.empty:
+            print("Not enough trade data for Ulcer Index.")
+            return
+        if trade_type.lower() == "long":
+            dd = (trade_df['Bid'] - trade_df['Bid'].cummax()) / trade_df['Bid'].cummax() * 100
+        else:
+            dd = (trade_df['Ask'].cummin() - trade_df['Ask']) / trade_df['Ask'].cummin() * 100
+        UI = np.sqrt((dd**2).mean())
+        UPI = (ret - risk) / UI if UI != 0 else np.inf
+        CALMAR = (ret - risk) / abs(mdd) if abs(mdd) >= 0 else np.inf
+        print(f"Return: {ret:.2f}%")
+        print(f"Risk: {risk:.2f}%")
 
-    plt.figure(figsize=(20, 6))
-    plt.scatter(match_time, entry_price, color="green", label="Entry True", s=50)
-    plt.scatter(gmt_entry_time, entry_price, marker='x', color="orange", label="Entry Approx", s=50)
-    plt.scatter(exit_time, exit_price, color="red", label="Exit True", s=50)
-    plt.plot(window['Gmt time'], window['price'], color='white', label='Price')
-    plt.title(f"Price Movement on {gmt_entry_time.date()} (±12h)")
-    plt.xlabel('Time (GMT)')
+        print(f"MDD: {-mdd:.2f}%")
+        print(f"Calmar: {UPI:.2f}")
+        
+        print(f"UI: {UI:.2f}%") #Ulcer Index
+        print(f"UPI: {UPI:.2f}")
+        print(f"Exit Time: {exit_time}")
+
+    # plot from entry+12hrs to exit+12hrs
+    extended_window = data[(data['Local time'] >= entry_time - pd.Timedelta(hours=12)) &
+                           (data['Local time'] <= exit_time + pd.Timedelta(hours=12))]
+    print(f"Plotting from {entry_time - pd.Timedelta(hours=12)} to {exit_time + pd.Timedelta(hours=12)}")
+    
+    plt.figure(figsize=(20, 10))
+    
+    plt.plot(extended_window['Local time'], extended_window['Ask'], color='linen', label='Ask Price', linewidth=0.75, alpha=0.75)
+    plt.plot(extended_window['Local time'], extended_window['Bid'], color='bisque', label='Bid Price', linewidth=0.75, alpha=0.75)
+
+    EntrySignal = "v"
+    ExitSignal = "^"
+    if(trade_type == "Long" or trade_type == "long"):
+        EntrySignal = "^"
+        ExitSignal = "v"
+    
+    plt.scatter(match_time, entry_price, marker=EntrySignal, color="lime", label="Entry Tick", s=150)
+    plt.scatter(entry_time, entry_price, marker='x', color="aqua", label="Approx Entry", s=50)
+    if ret is not None:
+        plt.scatter(exit_time, exit_price, marker=ExitSignal, color="red", label="Exit Tick", s=150)
+    plt.title(f"Price Movement from {entry_time - pd.Timedelta(hours=12)} to {exit_time + pd.Timedelta(hours=12)}")
+    plt.xlabel('Time (Local)')
     plt.ylabel('Price')
     plt.legend()
     plt.xticks(rotation=45)
     plt.tight_layout()
     plt.show()
 
-
-# Parameters and execution.
-trade_date = "31/10/2023  09:45:00"
+# Parameters:
+trade_date = "31/10/2023 09:45:00"
 trade_type = "short"
 entry_price = 1.06643
 exit_price = 1.05706
-risk = 0.033
+sl = 1.06882
+risk = 3.3
+exit_mode = "Partial"              # "TP", "SL", or "Partial"
 
-find_and_plot(trade_date, trade_type, entry_price, exit_price, risk, data)
+find_and_plot(trade_date, trade_type, entry_price, exit_price, sl, risk, exit_mode, data)
