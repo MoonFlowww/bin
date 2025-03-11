@@ -1,0 +1,3 @@
+- Informated reinforcement learning (Guilbaud & Pham)
+- Price.stationary -> FFT for fractality exhaustion (+SE-block and DTW)
+- Elhers loops in transformed space
