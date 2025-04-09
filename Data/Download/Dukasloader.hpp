@@ -2,7 +2,7 @@
 #define DUKASLOADER_HPP
 
 #include <system_error>
-#define NOMINMAX // curl include <windows.h> which use 
+#define NOMINMAX // curl include <windows.h> which use Min Max macro
 #include <curl/curl.h>
 #include <filesystem>
 #include <libpq-fe.h>
@@ -21,7 +21,15 @@
 #include <ctime>
 #include <cmath>
 #include <regex>
+#include <thread>
 
+#ifdef _WIN32
+#include <conio.h>
+#else
+#include <termios.h>
+#include <unistd.h>
+#include <fcntl.h>
+#endif
 
 class DukascopyDownloader {
 public:
@@ -45,40 +53,84 @@ public:
         std::cout << "Asset: " << asset << " || Range: " << start_date << " -> " << end_date << std::endl;
         init_curl();
         parse_dates(start_date, end_date);
+        try {
+            double point = determine_scaling(asset);
+            std::cout << "Asset: " << asset << ", Point: " << point << std::endl;
+        }
+        catch (const std::invalid_argument& e) {
+            std::cerr << e.what() << std::endl;
+        }
 
-        // PostgreSQL handling
+        bool update_mode = false;
+        bool livestream_mode = false;
+        std::chrono::system_clock::time_point last_data_point;
+        bool use_last_data_point = false;
+
         if (!pg_url.empty()) {
             connect_to_postgres();
-            std::string table_name = sanitize_identifier(asset) + (aggregation_enabled ? "_" + sanitize_identifier(timeframe) : "_tickdata");
-            // Check if table exists and contains data
+
+            {
+                std::string set_timezone = "SET TIME ZONE 'UTC';";
+                PGresult* res = PQexec(pg_conn, set_timezone.c_str());
+                PQclear(res);
+            }
+
+            std::string table_name = sanitize_identifier(asset) +
+                (aggregation_enabled ? "_" + sanitize_identifier(timeframe) : "_tickdata");
+
             std::string check_sql = "SELECT COUNT(*) FROM \"" + table_name + "\";";
             PGresult* res = PQexec(pg_conn, check_sql.c_str());
             bool table_exists = false;
             if (PQresultStatus(res) == PGRES_TUPLES_OK) {
                 std::string count_str = PQgetvalue(res, 0, 0);
-                if (std::stoi(count_str) > 0)
-                    table_exists = true;
+                table_exists = (std::stoi(count_str) > 0);
             }
             PQclear(res);
+
             if (table_exists) {
-                std::cout << "Table \"" << table_name << "\" already exists with data. Update (u) or Restart (r)? ";
+                std::cout << "Table \"" << table_name << "\" already exists. Update (u) or Restart (r)? ";
                 char response;
                 std::cin >> response;
+
                 if (response == 'u' || response == 'U') {
-                    std::string last_sql = aggregation_enabled ?
-                        "SELECT to_char(max(interval_start), 'YYYY-MM-DD HH24:MI:SS') FROM \"" + table_name + "\";" :
-                        "SELECT to_char(max(timestamp), 'YYYY-MM-DD HH24:MI:SS') FROM \"" + table_name + "\";";
+                    update_mode = true;
+                    
+                    std::string last_sql = aggregation_enabled
+                        ? "SELECT to_char(max(interval_start) AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US TZH') FROM \"" + table_name + "\";"
+                        : "SELECT to_char(max(timestamp) AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US TZH') FROM \"" + table_name + "\";";
+
                     PGresult* res_last = PQexec(pg_conn, last_sql.c_str());
                     if (PQresultStatus(res_last) == PGRES_TUPLES_OK) {
                         char* last_ts = PQgetvalue(res_last, 0, 0);
-                        if (last_ts && std::string(last_ts).size() > 0) {
+                        if (last_ts && !std::string(last_ts).empty()) {
                             std::tm tm = {};
                             std::istringstream ss(last_ts);
-                            ss >> std::get_time(&tm, "%Y-%m-%d %H:%M:%S");
+                            ss >> std::get_time(&tm, "%Y-%m-%d %H:%M:%S.%3NZ");
                             if (!ss.fail()) {
-                                start_time = std::chrono::system_clock::from_time_t(_mkgmtime(&tm));
+                                last_data_point = std::chrono::system_clock::from_time_t(_mkgmtime(&tm));
+                                
+                                std::cout << "Last data point: " << last_ts << std::endl;
+                                std::cout << "Download from last data point to: End date (e), Now (n)? ";
+                                char update_option;
+                                std::cin >> update_option;
+                                
+                                if (update_option == 'n' || update_option == 'N') {
+                                    end_time = std::chrono::system_clock::now();
+                                    
+                                    std::cout << "Download mode: Fixed point (f), Livestream (l)? ";
+                                    char stream_option;
+                                    std::cin >> stream_option;
+                                    
+                                    if (stream_option == 'l' || stream_option == 'L') {
+                                        livestream_mode = true;
+                                    }
+                                }
+                                
+                                start_time = last_data_point + std::chrono::hours(1);
+                                use_last_data_point = true;
+                                
                                 if (verbose_level == 1)
-                                    std::cout << "Updated start date from table: " << last_ts << std::endl;
+                                    std::cout << "Resuming from: " << last_ts << std::endl;
                             }
                         }
                     }
@@ -86,8 +138,7 @@ public:
                 }
                 else {
                     std::string drop_sql = "DROP TABLE IF EXISTS \"" + table_name + "\";";
-                    PGresult* res_drop = PQexec(pg_conn, drop_sql.c_str());
-                    PQclear(res_drop);
+                    PQexec(pg_conn, drop_sql.c_str());
                     create_table();
                 }
             }
@@ -95,7 +146,7 @@ public:
                 create_table();
             }
             if (verbose_level == 1)
-                std::cout << "PostgreSQL connected and table ready: " << table_name << std::endl;
+                std::cout << "PostgreSQL ready for: " << table_name << std::endl;
         }
 
         // CSV handling
@@ -106,6 +157,7 @@ public:
                 char response;
                 std::cin >> response;
                 if (response == 'u' || response == 'U') {
+                    update_mode = true;
                     std::ifstream infile(csv_path);
                     std::string line, last;
                     while (std::getline(infile, line)) {
@@ -120,7 +172,29 @@ public:
                             std::istringstream ss(ts);
                             ss >> std::get_time(&tm, "%Y-%m-%d %H:%M:%S");
                             if (!ss.fail()) {
-                                start_time = std::chrono::system_clock::from_time_t(_mkgmtime(&tm));
+                                last_data_point = std::chrono::system_clock::from_time_t(_mkgmtime(&tm));
+                                
+                                if (!use_last_data_point) {
+                                    std::cout << "Last data point: " << ts << std::endl;
+                                    std::cout << "Download from last data point to: End date (e), Now (n)? ";
+                                    char update_option;
+                                    std::cin >> update_option;
+                                    
+                                    if (update_option == 'n' || update_option == 'N') {
+                                        end_time = std::chrono::system_clock::now();
+                                        
+                                        std::cout << "Download mode: Fixed point (f), Livestream (l)? ";
+                                        char stream_option;
+                                        std::cin >> stream_option;
+                                        
+                                        if (stream_option == 'l' || stream_option == 'L') {
+                                            livestream_mode = true;
+                                        }
+                                    }
+                                }
+                                
+                                start_time = last_data_point + std::chrono::hours(1);
+                                
                                 if (verbose_level == 1)
                                     std::cout << "Updated start date from CSV: " << ts << std::endl;
                             }
@@ -134,6 +208,8 @@ public:
             }
             prepare_csv();
         }
+        
+        this->livestream_mode = livestream_mode;
     }
     ~DukascopyDownloader() {
         if (csv_file.is_open())
@@ -144,10 +220,30 @@ public:
         }
         curl_global_cleanup();
     }
+    double determine_scaling(const std::string& asset) {
+        if (asset == "BTCUSD")
+            return 1e4;
+        else if (asset == "USDRUB" || asset == "XAGUSD" || asset == "XAUUSD")
+            return 1e3;
+        else if (asset == "EURUSD" || asset == "GBPUSD" || asset == "AUDUSD" || asset == "NZDUSD")
+            return 1e5;
+        else if (asset == "USDJPY" || asset == "EURJPY" || asset == "GBPJPY" || asset == "AUDJPY" || asset == "NZDJPY")
+            return 1e2;
+        else if (asset == "SPX500" || asset == "NAS100" || asset == "UK100" || asset == "GER30" || asset == "FRA40")
+            return 1e1;
+        else if (asset == "BRENT" || asset == "WTI")
+            return 1e2;
+        else {
+            std::cerr << "ERROR: Unknown asset: " + asset << std::endl;
+            throw std::invalid_argument("Unknown asset: " + asset + "\n    -> Unknown magnitude for tick translation from bi5(full int) to double\n      -> Line ~633");
+            return -10; // unreachable
+        }
+    }
+
 
 
     std::string getOutputFilePath(const std::string& downloadDir, const std::string& asset, bool aggregationEnabled) {
-        return (std::filesystem::path(downloadDir) / (asset + (aggregationEnabled ? "_aggregated.csv" : "_ticks.csv"))).string();
+        return downloadDir + "/" + asset + (aggregationEnabled ? "_aggregated.csv" : "_ticks.csv");
     }
 
     bool handleExistingFile(const std::string& downloadDir, const std::string& asset, bool aggregationEnabled) {
@@ -186,10 +282,10 @@ public:
             int hour = tm_base.tm_hour;
             std::ostringstream oss_url;
             oss_url << "https://datafeed.dukascopy.com/datafeed/" << asset << "/"
-                << std::put_time(&tm_base, "%Y/")  // Year (4 digits)
-                << std::setw(2) << std::setfill('0') << tm_base.tm_mon << "/"  // Month[00;11] 00=January | 11=December
-                << std::put_time(&tm_base, "%d/")  // Day (01-31)
-                << std::put_time(&tm_base, "%H") << "h_ticks.bi5";  // Hour (00-23)
+                << std::put_time(&tm_base, "%Y/")
+                << std::setw(2) << std::setfill('0') << tm_base.tm_mon << "/"
+                << std::put_time(&tm_base, "%d/")
+                << std::put_time(&tm_base, "%H") << "h_ticks.bi5";
             std::string url = oss_url.str();
 
             if (verbose_level == 2)
@@ -245,6 +341,23 @@ public:
             current_index++;
             if (verbose_level == 1)
                 update_progress(current_index, total_hours, total_bytes_downloaded, overall_start);
+            
+            if (livestream_mode && (current_time >= end_time)) {
+                std::cout << "\nCaught up to current time. Waiting for new data..." << std::endl;
+                std::this_thread::sleep_for(std::chrono::minutes(1));
+                
+                end_time = std::chrono::system_clock::now();
+                
+                if (_kbhit()) {
+                    char ch = _getch();
+                    if (ch == 'q' || ch == 'Q') {
+                        std::cout << "\nLivestream stopped by user." << std::endl;
+                        break;
+                    }
+                }
+                
+                total_hours = std::chrono::duration_cast<std::chrono::hours>(end_time - start_time).count();
+            }
         }
         if (has_current_bar) {
             write_aggregated_bar(current_bar);
@@ -291,6 +404,7 @@ private:
     std::string pg_url;
     AggregatedBar current_bar;
     bool has_current_bar = false;
+    bool livestream_mode = false;
 
     void parse_timeframe(const std::string& tf) {
         std::regex pattern(R"(^(\d+)([smhd])$)");
@@ -337,7 +451,7 @@ private:
         std::string create_sql;
         if (aggregation_enabled) {
             create_sql = "CREATE TABLE IF NOT EXISTS \"" + table_name + "\" ("
-                "interval_start TIMESTAMP WITH TIME ZONE PRIMARY KEY,"
+                "interval_start TIMESTAMP(3) WITHOUT TIME ZONE PRIMARY KEY,"
                 "open_ask DOUBLE PRECISION,"
                 "high_ask DOUBLE PRECISION,"
                 "low_ask DOUBLE PRECISION,"
@@ -351,7 +465,7 @@ private:
         }
         else {
             create_sql = "CREATE TABLE IF NOT EXISTS \"" + table_name + "\" ("
-                "timestamp TIMESTAMP WITH TIME ZONE,"
+                "timestamp TIMESTAMP(3) WITHOUT TIME ZONE,"
                 "ask DOUBLE PRECISION,"
                 "bid DOUBLE PRECISION,"
                 "ask_volume DOUBLE PRECISION,"
@@ -415,7 +529,7 @@ private:
     std::chrono::system_clock::time_point parse_date(const std::string& date_str) {
         std::tm tm = {};
         std::istringstream ss(date_str);
-        ss.imbue(std::locale::classic()); //potential fix for the data shift
+        ss.imbue(std::locale::classic());
         ss >> std::get_time(&tm, "%Y-%m-%d");
         if (ss.fail())
             throw std::invalid_argument("Invalid date format, use YYYY-MM-DD");
@@ -514,8 +628,7 @@ private:
         gmtime_s(&display_tm, &display_seconds);
         std::ostringstream oss;
         oss << std::put_time(&display_tm, "%Y-%m-%d %H:%M:%S")
-            << "." << std::setw(3) << std::setfill('0') << ms
-            << "+00";
+            << "." << std::setw(3) << std::setfill('0') << ms;
         return oss.str();
     }
 
@@ -526,9 +639,11 @@ private:
         uint32_t bid_raw = (uint32_t(data[8]) << 24) | (uint32_t(data[9]) << 16) | (uint32_t(data[10]) << 8) | data[11];
         float ask_vol_raw = read_be_float(data + 12);
         float bid_vol_raw = read_be_float(data + 16);
-        double point = (asset == "usdrub" || asset == "xagusd" || asset == "xauusd") ? 1e3 : 1e5;
+        double point = determine_scaling(asset); // TODO: do it automatically
+
         double ask = static_cast<double>(ask_raw) / point;
         double bid = static_cast<double>(bid_raw) / point;
+
         double ask_volume = ask_vol_raw;
         double bid_volume = bid_vol_raw;
         std::string ts = format_tick_timestamp(base_tm, offset);
@@ -645,11 +760,20 @@ private:
 
 
     void prepare_csv() {
-        std::string folder_path = download_dir + "/" + asset + (aggregation_enabled ? "_aggregated.csv" : "_ticks.csv");
+        std::string path;
+        if (aggregation_enabled) {
+            path = download_dir + "/" + asset + "_aggregated.csv";
+        } else {
+            path = download_dir + "/" + asset + "_ticks.csv";
+        }
+        
+        // Ensure directory exists
+        std::filesystem::path dir = std::filesystem::path(path).parent_path();
         std::error_code ec;
-        if (!std::filesystem::exists(folder_path, ec))
-            std::filesystem::create_directories(folder_path, ec);
-        std::string path = folder_path + "/" + asset + "_ticks.csv";
+        if (!dir.empty() && !std::filesystem::exists(dir, ec)) {
+            std::filesystem::create_directories(dir, ec);
+        }
+        
         csv_file.open(path, std::ios::app);
         if (!csv_file.is_open())
             throw std::runtime_error("Cannot open output file: " + path);
@@ -685,7 +809,7 @@ private:
             std::string table_name = sanitize_identifier(asset) + "_tickdata";
             std::ostringstream oss;
             oss << "INSERT INTO \"" << table_name << "\" VALUES ("
-                << "'" << tick.timestamp << "',"
+                << '\'' << tick.timestamp << "',"
                 << tick.ask << ","
                 << tick.bid << ","
                 << tick.ask_volume << ","
@@ -729,6 +853,62 @@ private:
         std::cout << "] " << int(progress * 100) << "%, Remaining: " << time_remaining
             << ", Total Downloaded: " << total_bytes << " bytes" << std::flush;
     }
+
+#ifndef _WIN32
+    // Cross-platform equivalent of _kbhit for non-Windows systems
+    bool _kbhit() {
+        struct termios oldt, newt;
+        int ch;
+        int oldf;
+        
+        tcgetattr(STDIN_FILENO, &oldt);
+        newt = oldt;
+        newt.c_lflag &= ~(ICANON | ECHO);
+        tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+        oldf = fcntl(STDIN_FILENO, F_GETFL, 0);
+        fcntl(STDIN_FILENO, F_SETFL, oldf | O_NONBLOCK);
+        
+        ch = getchar();
+        
+        tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+        fcntl(STDIN_FILENO, F_SETFL, oldf);
+        
+        if(ch != EOF) {
+            ungetc(ch, stdin);
+            return true;
+        }
+        
+        return false;
+    }
+    
+    // Cross-platform equivalent of _getch for non-Windows systems
+    char _getch() {
+        char buf = 0;
+        struct termios old = {0};
+        
+        if (tcgetattr(0, &old) < 0)
+            return 0;
+            
+        old.c_lflag &= ~ICANON;
+        old.c_lflag &= ~ECHO;
+        old.c_cc[VMIN] = 1;
+        old.c_cc[VTIME] = 0;
+        
+        if (tcsetattr(0, TCSANOW, &old) < 0)
+            return 0;
+            
+        if (read(0, &buf, 1) < 0)
+            return 0;
+            
+        old.c_lflag |= ICANON;
+        old.c_lflag |= ECHO;
+        
+        if (tcsetattr(0, TCSADRAIN, &old) < 0)
+            return 0;
+            
+        return buf;
+    }
+#endif
 
 };
 
