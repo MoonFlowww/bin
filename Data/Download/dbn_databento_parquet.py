@@ -16,6 +16,7 @@ from concurrent.futures import as_completed
 from concurrent.futures import ProcessPoolExecutor
 
 def get_remote_file_size(ftp, filename):
+    """Get the size of a remote file."""
     try:
         ftp.voidcmd('TYPE I')
         size = ftp.size(filename)
@@ -35,6 +36,7 @@ def get_remote_file_size(ftp, filename):
     return None
 
 def check_download_status(local_filepath, remote_size):
+    """Check if file needs to be downloaded, resumed, or is complete."""
     if not os.path.exists(local_filepath):
         return "download", 0
     
@@ -53,6 +55,7 @@ def check_download_status(local_filepath, remote_size):
         return "redownload", 0
 
 def download_from_databento_ftp(ftp_url, local_dir="./input", username=None, password=None, resume=True):
+    """Download files from FTP with resume capability."""
     
     parsed = urlparse(ftp_url)
     host = parsed.hostname
@@ -197,6 +200,7 @@ def download_from_databento_ftp(ftp_url, local_dir="./input", username=None, pas
         print("FTP connection closed.")
 
 def download_single_file_with_resume(ftp_url, local_filepath=None, username=None, password=None, resume=True):
+    """Download a single file with resume capability."""
     
     parsed = urlparse(ftp_url)
     host = parsed.hostname
@@ -286,7 +290,7 @@ def get_ram_usage():
 def update_ram_display(pbar, stop_event):
     while not stop_event.is_set():
         pbar.set_postfix({'RAM': f'{get_ram_usage():.1f}%'})
-        pbar.refresh() # force redraw pbar
+        pbar.refresh()        # force redraw
         time.sleep(0.5)
 
 def convert_dbn_to_parquet_zst(input_path, output_path):
@@ -367,12 +371,13 @@ def process_files(input_folder, output_folder, max_workers=None):
 
 
 if __name__ == "__main__":
-    ftp_url = "_FTPLINK_"
-    input_folder = r"_FTP_DOWNLOAD_PATH_" # downloads dir
-    output_folder = r"_PARQUET_OUTPUT_PATH_" # parquet output
+    ftp_url = "ftp://ftp.databento.com/M8PMTAQS/GLBX-20250914-A7QP6MBN6J"
+    input_folder = r"C:\Users\moonfloww\Downloads\databento\databento_downloads" # downloads dir
+    output_folder = r"C:\Users\moonfloww\Downloads\databento\databento_output" # parquet output
     
-    print("Downloading all files from directory with resume support...")
-    download_from_databento_ftp(ftp_url, local_dir=input_folder, username="_EMAIL_", password="_PASSWORD_", resume=True) #resume: fallback if files already got computed
+    email = os.getenv("DATABENTO_EMAIL")
+    password = os.getenv("DATABENTO_PASSWORD")
+    download_from_databento_ftp(ftp_url, local_dir=input_folder, username=email, password=password, resume=True)
 
 
     
